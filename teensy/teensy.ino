@@ -251,7 +251,6 @@ void serialEvent() {
       Serial.println("[Teensy] All Motors Disabled.");
     } else if (ch == 'e' || ch == 'E') {
       for (int i = 0; i < NUM_MOTORS; i++) {
-        enableMotor(MST_IDS[i]); delay(20);
         enableMotor(SLV_IDS[i]); delay(20);
       }
       setupOffset(); // 재활성화 시 오프셋 재계산
