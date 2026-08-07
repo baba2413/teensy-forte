@@ -10,7 +10,7 @@ const size_t NUM_MOTORS = sizeof(MOTOR_IDS) / sizeof(MOTOR_IDS[0]);
 const uint32_t PRINT_PERIOD_MS = 2000; // 시리얼 출력 및 LED 반전 주기 (100ms = 0.1초)
 
 // Teensy 4.0/4.1 CAN1 사용 설정
-FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
+FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 
 // -------------------------------------------------------------
 // 2. Robstride 프로토콜 물리적 한계값 (스케일 변환용)
@@ -75,7 +75,7 @@ void requestMotorStatus(uint8_t motor_id) {
   msg.buf[6] = 0x00;
   msg.buf[7] = 0x00;
 
-  Can0.write(msg);
+  Can1.write(msg);
 }
 
 // -------------------------------------------------------------
@@ -125,19 +125,19 @@ void setup() {
     motorStates[i].updated = false;
   }
 
-  Can0.begin();
-  Can0.setBaudRate(1000000);
-  Can0.setMaxMB(64);
-  Can0.setMBFilter(ACCEPT_ALL);
-  Can0.distribute();
-  Can0.enableMBInterrupts();
-  Can0.onReceive(rxCallback);
+  Can1.begin();
+  Can1.setBaudRate(1000000);
+  Can1.setMaxMB(64);
+  Can1.setMBFilter(ACCEPT_ALL);
+  Can1.distribute();
+  Can1.enableMBInterrupts();
+  Can1.onReceive(rxCallback);
 
   Serial.println("CAN bus initialized. Monitoring motor states...");
 }
 
 void loop() {
-  Can0.events();
+  Can1.events();
 
   if (printTimer >= PRINT_PERIOD_MS) {
     printTimer -= PRINT_PERIOD_MS;
