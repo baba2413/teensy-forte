@@ -4,7 +4,7 @@
 // -------------------------------------------------------------
 // 1. 모터 ID 리스트 및 설정
 // -------------------------------------------------------------
-const uint8_t MOTOR_IDS[] = {1, 2,3,11,12,13}; 
+const uint8_t MOTOR_IDS[] = {1,2,3,4,11,12,13,14}; 
 const size_t NUM_MOTORS = sizeof(MOTOR_IDS) / sizeof(MOTOR_IDS[0]);
 
 const uint32_t PRINT_PERIOD_MS = 2000; // 시리얼 출력 및 LED 반전 주기 (100ms = 0.1초)
