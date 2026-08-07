@@ -15,6 +15,9 @@ const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2] = {13, 14};
 
 const uint8_t HOST_ID = 253;
 
+const float KP = 3.0f;
+const float KD = 0.0f;
+
 // Teensy 4.0/4.1 CAN1, CAN2 사용
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> Can2;
@@ -37,6 +40,9 @@ const float T_MAX = 18.0f;
 const uint32_t CONTROL_PERIOD_US = 2000;
 elapsedMicros controlTimer;
 
+// 위치 점프 판정 여유값 (실제 허용 변화량 = V_MAX * 경과시간 + 여유값)
+const float POSITION_JUMP_MARGIN_RAD = 0.20f;
+
 // -------------------------------------------------------------
 // 4. 실시간 상태 및 오프셋 변수
 // -------------------------------------------------------------
@@ -48,8 +54,39 @@ volatile float master_pos_can2[NUM_MOTORS_CAN2] = {0.0f, 0.0f};
 volatile float slave_pos_can2[NUM_MOTORS_CAN2]  = {0.0f, 0.0f};
 float pos_offset_can2[NUM_MOTORS_CAN2]          = {0.0f, 0.0f};
 
+// 추가: 오프셋 계산 전 새 피드백 수신 여부 확인
+volatile bool master_valid_can1[NUM_MOTORS_CAN1] = {false, false};
+volatile bool slave_valid_can1[NUM_MOTORS_CAN1]  = {false, false};
+volatile bool master_valid_can2[NUM_MOTORS_CAN2] = {false, false};
+volatile bool slave_valid_can2[NUM_MOTORS_CAN2]  = {false, false};
+
+bool offset_ready_can1[NUM_MOTORS_CAN1] = {false, false};
+bool offset_ready_can2[NUM_MOTORS_CAN2] = {false, false};
+
+// 추가: Type 2 피드백의 fault 및 mode 상태 저장
+volatile uint8_t fault_bits_can1[256] = {0};
+volatile uint8_t fault_bits_can2[256] = {0};
+volatile uint8_t motor_mode_can1[256] = {0};
+volatile uint8_t motor_mode_can2[256] = {0};
+volatile bool fault_changed_can1[256] = {false};
+volatile bool fault_changed_can2[256] = {false};
+
+// 추가: 위치 점프 및 위치 범위 순환 감시
+volatile bool position_initialized_can1[256] = {false};
+volatile bool position_initialized_can2[256] = {false};
+volatile float previous_position_can1[256] = {0.0f};
+volatile float previous_position_can2[256] = {0.0f};
+volatile uint32_t previous_position_us_can1[256] = {0};
+volatile uint32_t previous_position_us_can2[256] = {0};
+volatile bool position_jump_can1[256] = {false};
+volatile bool position_jump_can2[256] = {false};
+volatile float position_jump_delta_can1[256] = {0.0f};
+volatile float position_jump_delta_can2[256] = {0.0f};
+volatile bool position_wrap_can1[256] = {false};
+volatile bool position_wrap_can2[256] = {false};
+
 // -------------------------------------------------------------
-// 5. 데이터 스케일링 헬퍼 함수
+// 5. 데이터 스케일링 및 진단 헬퍼 함수
 // -------------------------------------------------------------
 uint16_t floatToUint(float x, float x_min, float x_max, uint8_t bits) {
   if (x < x_min) x = x_min;
@@ -59,6 +96,78 @@ uint16_t floatToUint(float x, float x_min, float x_max, uint8_t bits) {
 
 float uintToFloat(uint16_t x, float x_min, float x_max) {
   return x_min + (float)x * (x_max - x_min) / 65535.0f;
+}
+
+// 추가: 목표 위치가 프로토콜 위치 범위를 넘어가면 같은 주기의 위치로 환산
+float wrapPosition(float pos) {
+  const float range = P_MAX - P_MIN;
+
+  while (pos > P_MAX) pos -= range;
+  while (pos < P_MIN) pos += range;
+
+  return pos;
+}
+
+// 추가: Type 2 피드백에 포함된 fault 상태 출력
+void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) {
+  Serial.printf("[%s FAULT] Motor %d | Raw: 0x%02X", can_name, motor_id, fault_bits);
+
+  if (fault_bits == 0) {
+    Serial.println(" | CLEARED");
+    return;
+  }
+
+  if (fault_bits & (1 << 0)) Serial.print(" | UNDERVOLTAGE");
+  if (fault_bits & (1 << 1)) Serial.print(" | THREE_PHASE_OVERCURRENT");
+  if (fault_bits & (1 << 2)) Serial.print(" | OVERTEMPERATURE");
+  if (fault_bits & (1 << 3)) Serial.print(" | MAGNETIC_ENCODER_FAULT");
+  if (fault_bits & (1 << 4)) Serial.print(" | STALL_OVERLOAD");
+  if (fault_bits & (1 << 5)) Serial.print(" | UNCALIBRATED");
+
+  Serial.println();
+}
+
+// 추가: 한 피드백 주기에서 물리적으로 설명하기 어려운 위치 점프 감지
+bool checkPositionJump(uint8_t motor_id, float current_pos,
+                       volatile bool* initialized,
+                       volatile float* previous_position,
+                       volatile uint32_t* previous_time_us,
+                       volatile bool* jump_flag,
+                       volatile float* jump_delta,
+                       volatile bool* wrap_flag) {
+  uint32_t now_us = micros();
+
+  if (!initialized[motor_id]) {
+    initialized[motor_id] = true;
+    previous_position[motor_id] = current_pos;
+    previous_time_us[motor_id] = now_us;
+    return true;
+  }
+
+  float raw_delta = current_pos - previous_position[motor_id];
+  const float range = P_MAX - P_MIN;
+
+  // 위치 범위 경계 수준의 큰 변화도 표시만 하고 점프 판정에서는 예외 처리하지 않음
+  if (raw_delta > range * 0.5f || raw_delta < -range * 0.5f) {
+    wrap_flag[motor_id] = true;
+  }
+
+  uint32_t dt_us = now_us - previous_time_us[motor_id];
+  float dt = (float)dt_us * 1.0e-6f;
+  float allowed_delta = V_MAX * dt + POSITION_JUMP_MARGIN_RAD;
+
+  // 변경: 이유와 관계없이 위치 점프로 판정되면 이 패킷을 버림
+  if (fabsf(raw_delta) > allowed_delta) {
+    jump_delta[motor_id] = raw_delta;
+    jump_flag[motor_id] = true;
+
+    // 점프 패킷은 다음 비교 기준에도 저장하지 않음
+    return false;
+  }
+
+  previous_position[motor_id] = current_pos;
+  previous_time_us[motor_id] = now_us;
+  return true;
 }
 
 // -------------------------------------------------------------
@@ -201,19 +310,45 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
 // 8. CAN 수신 인터럽트 콜백
 // -------------------------------------------------------------
 void rxCallbackCan1(const CAN_message_t &msg) {
+  // 추가: Robstride private protocol은 extended CAN frame 사용
+
   uint8_t mode = (msg.id >> 24) & 0x1F;
 
   if (mode == 2) {
+    // 추가: Type 2 피드백은 8Byte만 처리
     uint8_t motor_id = (msg.id >> 8) & 0xFF;
+    uint8_t new_fault_bits = (msg.id >> 16) & 0x3F;
+    uint8_t new_motor_mode = (msg.id >> 22) & 0x03;
+
     uint16_t p_raw = ((uint16_t)msg.buf[0] << 8) | msg.buf[1];
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+
+    // 변경: 위치 점프 패킷은 위치/fault/mode/valid 상태에 반영하지 않고 즉시 폐기
+    if (!checkPositionJump(motor_id, current_pos,
+                           position_initialized_can1,
+                           previous_position_can1,
+                           previous_position_us_can1,
+                           position_jump_can1,
+                           position_jump_delta_can1,
+                           position_wrap_can1)) {
+      return;
+    }
+
+    // 추가: fault/mode 상태 저장, fault 변화 시 메인 루프에서 출력
+    if (new_fault_bits != fault_bits_can1[motor_id]) {
+      fault_bits_can1[motor_id] = new_fault_bits;
+      fault_changed_can1[motor_id] = true;
+    }
+    motor_mode_can1[motor_id] = new_motor_mode;
 
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
       if (motor_id == MST_IDS_CAN1[i]) {
         master_pos_can1[i] = current_pos;
+        master_valid_can1[i] = true;
         break;
       } else if (motor_id == SLV_IDS_CAN1[i]) {
         slave_pos_can1[i] = current_pos;
+        slave_valid_can1[i] = true;
         break;
       }
     }
@@ -221,19 +356,45 @@ void rxCallbackCan1(const CAN_message_t &msg) {
 }
 
 void rxCallbackCan2(const CAN_message_t &msg) {
+  // 추가: Robstride private protocol은 extended CAN frame 사용
+
   uint8_t mode = (msg.id >> 24) & 0x1F;
 
   if (mode == 2) {
+    // 추가: Type 2 피드백은 8Byte만 처리
     uint8_t motor_id = (msg.id >> 8) & 0xFF;
+    uint8_t new_fault_bits = (msg.id >> 16) & 0x3F;
+    uint8_t new_motor_mode = (msg.id >> 22) & 0x03;
+
     uint16_t p_raw = ((uint16_t)msg.buf[0] << 8) | msg.buf[1];
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+
+    // 변경: 위치 점프 패킷은 위치/fault/mode/valid 상태에 반영하지 않고 즉시 폐기
+    if (!checkPositionJump(motor_id, current_pos,
+                           position_initialized_can2,
+                           previous_position_can2,
+                           previous_position_us_can2,
+                           position_jump_can2,
+                           position_jump_delta_can2,
+                           position_wrap_can2)) {
+      return;
+    }
+
+    // 추가: fault/mode 상태 저장, fault 변화 시 메인 루프에서 출력
+    if (new_fault_bits != fault_bits_can2[motor_id]) {
+      fault_bits_can2[motor_id] = new_fault_bits;
+      fault_changed_can2[motor_id] = true;
+    }
+    motor_mode_can2[motor_id] = new_motor_mode;
 
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
       if (motor_id == MST_IDS_CAN2[i]) {
         master_pos_can2[i] = current_pos;
+        master_valid_can2[i] = true;
         break;
       } else if (motor_id == SLV_IDS_CAN2[i]) {
         slave_pos_can2[i] = current_pos;
+        slave_valid_can2[i] = true;
         break;
       }
     }
@@ -244,6 +405,19 @@ void rxCallbackCan2(const CAN_message_t &msg) {
 // 9. 초기 위치 오프셋 측정 헬퍼 함수
 // -------------------------------------------------------------
 void setupOffset() {
+  // 추가: 이전 피드백을 재사용하지 않고 새 응답을 확인
+  for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
+    master_valid_can1[i] = false;
+    slave_valid_can1[i] = false;
+    offset_ready_can1[i] = false;
+  }
+
+  for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
+    master_valid_can2[i] = false;
+    slave_valid_can2[i] = false;
+    offset_ready_can2[i] = false;
+  }
+
   // 모터 피드백 유도를 위한 Dummy 명령 전송
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -264,18 +438,84 @@ void setupOffset() {
 
   // CAN1 각 쌍별 초기 오프셋 계산
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
+    uint8_t master_id = MST_IDS_CAN1[i];
+    uint8_t slave_id = SLV_IDS_CAN1[i];
+
+    // 추가: 양쪽 모터의 새 피드백 수신 및 fault 상태 확인 후 계산
+    if (!master_valid_can1[i] || !slave_valid_can1[i]) {
+      Serial.printf("[SETUP CAN1] Pair %d Offset FAILED: feedback missing "
+                    "(Master %d: %s, Slave %d: %s)\r\n",
+                    i + 1,
+                    master_id, master_valid_can1[i] ? "OK" : "NO",
+                    slave_id, slave_valid_can1[i] ? "OK" : "NO");
+      continue;
+    }
+
+    if (fault_bits_can1[master_id] != 0 || fault_bits_can1[slave_id] != 0) {
+      Serial.printf("[SETUP CAN1] Pair %d Offset FAILED: motor fault "
+                    "(Master %d: 0x%02X, Slave %d: 0x%02X)\r\n",
+                    i + 1,
+                    master_id, fault_bits_can1[master_id],
+                    slave_id, fault_bits_can1[slave_id]);
+      continue;
+    }
+
+    if (!isfinite(master_pos_can1[i]) || !isfinite(slave_pos_can1[i])) {
+      Serial.printf("[SETUP CAN1] Pair %d Offset FAILED: invalid position value\r\n",
+                    i + 1);
+      continue;
+    }
+
     pos_offset_can1[i] = slave_pos_can1[i] - master_pos_can1[i];
-    Serial.printf("[SETUP CAN1] Pair %d Offset Calculated: %.3f rad (Master %d: %.3f, Slave %d: %.3f)\r\n",
-                  i + 1, pos_offset_can1[i], MST_IDS_CAN1[i], master_pos_can1[i],
-                  SLV_IDS_CAN1[i], slave_pos_can1[i]);
+    offset_ready_can1[i] = true;
+
+    Serial.printf("[SETUP CAN1] Pair %d Offset Calculated: %.3f rad "
+                  "(Master %d: %.3f, Slave %d: %.3f, Mode %d/%d)\r\n",
+                  i + 1, pos_offset_can1[i],
+                  master_id, master_pos_can1[i],
+                  slave_id, slave_pos_can1[i],
+                  motor_mode_can1[master_id], motor_mode_can1[slave_id]);
   }
 
   // CAN2 각 쌍별 초기 오프셋 계산
   for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
+    uint8_t master_id = MST_IDS_CAN2[i];
+    uint8_t slave_id = SLV_IDS_CAN2[i];
+
+    // 추가: 양쪽 모터의 새 피드백 수신 및 fault 상태 확인 후 계산
+    if (!master_valid_can2[i] || !slave_valid_can2[i]) {
+      Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: feedback missing "
+                    "(Master %d: %s, Slave %d: %s)\r\n",
+                    i + 3,
+                    master_id, master_valid_can2[i] ? "OK" : "NO",
+                    slave_id, slave_valid_can2[i] ? "OK" : "NO");
+      continue;
+    }
+
+    if (fault_bits_can2[master_id] != 0 || fault_bits_can2[slave_id] != 0) {
+      Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: motor fault "
+                    "(Master %d: 0x%02X, Slave %d: 0x%02X)\r\n",
+                    i + 3,
+                    master_id, fault_bits_can2[master_id],
+                    slave_id, fault_bits_can2[slave_id]);
+      continue;
+    }
+
+    if (!isfinite(master_pos_can2[i]) || !isfinite(slave_pos_can2[i])) {
+      Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: invalid position value\r\n",
+                    i + 3);
+      continue;
+    }
+
     pos_offset_can2[i] = slave_pos_can2[i] - master_pos_can2[i];
-    Serial.printf("[SETUP CAN2] Pair %d Offset Calculated: %.3f rad (Master %d: %.3f, Slave %d: %.3f)\r\n",
-                  i + 3, pos_offset_can2[i], MST_IDS_CAN2[i], master_pos_can2[i],
-                  SLV_IDS_CAN2[i], slave_pos_can2[i]);
+    offset_ready_can2[i] = true;
+
+    Serial.printf("[SETUP CAN2] Pair %d Offset Calculated: %.3f rad "
+                  "(Master %d: %.3f, Slave %d: %.3f, Mode %d/%d)\r\n",
+                  i + 3, pos_offset_can2[i],
+                  master_id, master_pos_can2[i],
+                  slave_id, slave_pos_can2[i],
+                  motor_mode_can2[master_id], motor_mode_can2[slave_id]);
   }
 }
 
@@ -319,6 +559,79 @@ void loop() {
   Can1.events();
   Can2.events();
 
+  // 추가: 수신 콜백에서는 상태만 저장하고 실제 Serial 출력은 메인 루프에서 수행
+  for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
+    uint8_t ids[2] = {MST_IDS_CAN1[i], SLV_IDS_CAN1[i]};
+
+    for (int j = 0; j < 2; j++) {
+      uint8_t motor_id = ids[j];
+
+      if (fault_changed_can1[motor_id]) {
+        noInterrupts();
+        uint8_t fault = fault_bits_can1[motor_id];
+        fault_changed_can1[motor_id] = false;
+        interrupts();
+
+        printFaultBits("CAN1", motor_id, fault);
+      }
+
+      if (position_wrap_can1[motor_id]) {
+        noInterrupts();
+        position_wrap_can1[motor_id] = false;
+        interrupts();
+
+        Serial.printf("[CAN1 WRAP] Motor %d position crossed P_MIN/P_MAX boundary\r\n",
+                      motor_id);
+      }
+
+      if (position_jump_can1[motor_id]) {
+        noInterrupts();
+        float delta = position_jump_delta_can1[motor_id];
+        position_jump_can1[motor_id] = false;
+        interrupts();
+
+        Serial.printf("[CAN1 JUMP] Motor %d unexpected position delta: %.3f rad\r\n",
+                      motor_id, delta);
+      }
+    }
+  }
+
+  for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
+    uint8_t ids[2] = {MST_IDS_CAN2[i], SLV_IDS_CAN2[i]};
+
+    for (int j = 0; j < 2; j++) {
+      uint8_t motor_id = ids[j];
+
+      if (fault_changed_can2[motor_id]) {
+        noInterrupts();
+        uint8_t fault = fault_bits_can2[motor_id];
+        fault_changed_can2[motor_id] = false;
+        interrupts();
+
+        printFaultBits("CAN2", motor_id, fault);
+      }
+
+      if (position_wrap_can2[motor_id]) {
+        noInterrupts();
+        position_wrap_can2[motor_id] = false;
+        interrupts();
+
+        Serial.printf("[CAN2 WRAP] Motor %d position crossed P_MIN/P_MAX boundary\r\n",
+                      motor_id);
+      }
+
+      if (position_jump_can2[motor_id]) {
+        noInterrupts();
+        float delta = position_jump_delta_can2[motor_id];
+        position_jump_can2[motor_id] = false;
+        interrupts();
+
+        Serial.printf("[CAN2 JUMP] Motor %d unexpected position delta: %.3f rad\r\n",
+                      motor_id, delta);
+      }
+    }
+  }
+
   // 1초(1000ms)마다 내장 LED 반짝임 (토글)
   static uint32_t lastLedToggle = 0;
   if (millis() - lastLedToggle >= 1000) {
@@ -337,16 +650,30 @@ void loop() {
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
       operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 
-      float slave_target_pos = master_pos_can1[i] + pos_offset_can1[i];
-      operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
+      // 추가: 정상적으로 계산된 오프셋이 있을 때만 슬레이브 위치 제어
+      if (offset_ready_can1[i]) {
+        float slave_target_pos = master_pos_can1[i] + pos_offset_can1[i];
+
+        // 추가: master + offset이 위치 범위를 넘을 경우 주기 범위로 환산
+        slave_target_pos = wrapPosition(slave_target_pos);
+
+        operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
+      }
     }
 
     // CAN2: 마스터 3, 4 / 슬레이브 13, 14
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
       operationControlCan2(MST_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 
-      float slave_target_pos = master_pos_can2[i] + pos_offset_can2[i];
-      operationControlCan2(SLV_IDS_CAN2[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
+      // 추가: 정상적으로 계산된 오프셋이 있을 때만 슬레이브 위치 제어
+      if (offset_ready_can2[i]) {
+        float slave_target_pos = master_pos_can2[i] + pos_offset_can2[i];
+
+        // 추가: master + offset이 위치 범위를 넘을 경우 주기 범위로 환산
+        slave_target_pos = wrapPosition(slave_target_pos);
+
+        operationControlCan2(SLV_IDS_CAN2[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
+      }
     }
 
     // 500ms마다 상태 모니터링 출력
@@ -355,17 +682,21 @@ void loop() {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-        float slave_target_pos = master_pos_can1[i] + pos_offset_can1[i];
-        Serial.printf("[CAN1] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad (Target: %.3f)\r\n",
+        float slave_target_pos = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
+        Serial.printf("[CAN1] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad "
+                      "(Target: %.3f, Offset: %s)\r\n",
                       MST_IDS_CAN1[i], master_pos_can1[i],
-                      SLV_IDS_CAN1[i], slave_pos_can1[i], slave_target_pos);
+                      SLV_IDS_CAN1[i], slave_pos_can1[i], slave_target_pos,
+                      offset_ready_can1[i] ? "READY" : "NOT READY");
       }
 
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-        float slave_target_pos = master_pos_can2[i] + pos_offset_can2[i];
-        Serial.printf("[CAN2] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad (Target: %.3f)\r\n",
+        float slave_target_pos = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
+        Serial.printf("[CAN2] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad "
+                      "(Target: %.3f, Offset: %s)\r\n",
                       MST_IDS_CAN2[i], master_pos_can2[i],
-                      SLV_IDS_CAN2[i], slave_pos_can2[i], slave_target_pos);
+                      SLV_IDS_CAN2[i], slave_pos_can2[i], slave_target_pos,
+                      offset_ready_can2[i] ? "READY" : "NOT READY");
       }
 
       Serial.println();
