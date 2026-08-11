@@ -15,9 +15,9 @@ const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {};
 
 const uint8_t HOST_ID = 253;
 
-// 마스터 모터 햅틱 피드백 게인 (양방향 제어용)
-const float KP = 3.0f;
-const float KD = 0.0f;
+// 토크 피드백 반력 설정
+const float TORQUE_DEADZONE_NM = 0.15f;    // 미세 마찰 노이즈 제거용 데드존 (Nm)
+const float TORQUE_FEEDBACK_GAIN = 0.5f;   // 마스터 전달 반력 비율 (0.5 = 50% 전달)
 
 // Teensy 4.0/4.1 CAN1, CAN2 사용
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
@@ -41,23 +41,23 @@ const float T_MAX = 18.0f;
 const uint32_t CONTROL_PERIOD_US = 2000;
 elapsedMicros controlTimer;
 
-// 위치 점프 판정 여유값 (실제 허용 변화량 = V_MAX * 경과시간 + 여유값)
 const float POSITION_JUMP_MARGIN_RAD = 0.20f;
 
 // -------------------------------------------------------------
-// 4. 실시간 상태 및 오프셋 변수 (가변 크기 대응)
+// 4. 실시간 상태, 토크 및 오프셋 변수 (가변 크기 대응)
 // -------------------------------------------------------------
 #define SAFE_BUF_SIZE(n) ((n) > 0 ? (n) : 1)
 
 volatile float master_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile float slave_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
+volatile float slave_trq_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {}; // CAN1 슬레이브 실시간 토크
 float pos_offset_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]          = {};
 
 volatile float master_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 volatile float slave_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
+volatile float slave_trq_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {}; // CAN2 슬레이브 실시간 토크
 float pos_offset_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]          = {};
 
-// 오프셋 계산 전 새 피드백 수신 여부 확인
 volatile bool master_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile bool slave_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
 volatile bool master_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
@@ -66,7 +66,7 @@ volatile bool slave_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 bool offset_ready_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 bool offset_ready_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 
-// Type 2 피드백의 fault 및 mode 상태 저장 (전체 ID 0~255 매핑)
+// Type 2 피드백 진단 상태 매핑
 volatile uint8_t fault_bits_can1[256] = {0};
 volatile uint8_t fault_bits_can2[256] = {0};
 volatile uint8_t motor_mode_can1[256] = {0};
@@ -74,7 +74,6 @@ volatile uint8_t motor_mode_can2[256] = {0};
 volatile bool fault_changed_can1[256] = {false};
 volatile bool fault_changed_can2[256] = {false};
 
-// 위치 점프 및 위치 범위 순환 감시
 volatile bool position_initialized_can1[256] = {false};
 volatile bool position_initialized_can2[256] = {false};
 volatile float previous_position_can1[256] = {0.0f};
@@ -103,11 +102,20 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
 
 float wrapPosition(float pos) {
   const float range = P_MAX - P_MIN;
-
   while (pos > P_MAX) pos -= range;
   while (pos < P_MIN) pos += range;
-
   return pos;
+}
+
+// 토크 데드존 필터링 함수
+float processTorqueDeadzone(float trq, float deadzone) {
+  if (fabsf(trq) < deadzone) {
+    return 0.0f;
+  } else if (trq > 0.0f) {
+    return trq - deadzone;
+  } else {
+    return trq + deadzone;
+  }
 }
 
 void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) {
@@ -291,7 +299,7 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
 }
 
 // -------------------------------------------------------------
-// 8. CAN 수신 인터럽트 콜백
+// 8. CAN 수신 인터럽트 콜백 (토크 파싱 추가)
 // -------------------------------------------------------------
 void rxCallbackCan1(const CAN_message_t &msg) {
   uint8_t mode = (msg.id >> 24) & 0x1F;
@@ -302,7 +310,10 @@ void rxCallbackCan1(const CAN_message_t &msg) {
     uint8_t new_motor_mode = (msg.id >> 22) & 0x03;
 
     uint16_t p_raw = ((uint16_t)msg.buf[0] << 8) | msg.buf[1];
+    uint16_t t_raw = ((uint16_t)msg.buf[4] << 8) | msg.buf[5]; // 토크 Raw 읽기
+
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+    float current_trq = uintToFloat(t_raw, T_MIN, T_MAX); // 토크 변환
 
     if (!checkPositionJump(motor_id, current_pos,
                            position_initialized_can1,
@@ -327,6 +338,7 @@ void rxCallbackCan1(const CAN_message_t &msg) {
         break;
       } else if (motor_id == SLV_IDS_CAN1[i]) {
         slave_pos_can1[i] = current_pos;
+        slave_trq_can1[i] = current_trq; // 슬레이브 실시간 토크 저장
         slave_valid_can1[i] = true;
         break;
       }
@@ -343,7 +355,10 @@ void rxCallbackCan2(const CAN_message_t &msg) {
     uint8_t new_motor_mode = (msg.id >> 22) & 0x03;
 
     uint16_t p_raw = ((uint16_t)msg.buf[0] << 8) | msg.buf[1];
+    uint16_t t_raw = ((uint16_t)msg.buf[4] << 8) | msg.buf[5];
+
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+    float current_trq = uintToFloat(t_raw, T_MIN, T_MAX);
 
     if (!checkPositionJump(motor_id, current_pos,
                            position_initialized_can2,
@@ -368,6 +383,7 @@ void rxCallbackCan2(const CAN_message_t &msg) {
         break;
       } else if (motor_id == SLV_IDS_CAN2[i]) {
         slave_pos_can2[i] = current_pos;
+        slave_trq_can2[i] = current_trq;
         slave_valid_can2[i] = true;
         break;
       }
@@ -391,7 +407,6 @@ void setupOffset() {
     offset_ready_can2[i] = false;
   }
 
-  // 모터 피드백 유도를 위한 Dummy 명령 전송
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
     operationControlCan1(SLV_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -408,7 +423,6 @@ void setupOffset() {
     Can2.events();
   }
 
-  // CAN1 오프셋 계산
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     uint8_t master_id = MST_IDS_CAN1[i];
     uint8_t slave_id = SLV_IDS_CAN1[i];
@@ -448,7 +462,6 @@ void setupOffset() {
                   motor_mode_can1[master_id], motor_mode_can1[slave_id]);
   }
 
-  // CAN2 오프셋 계산 (CAN1 개수를 반영하여 Pair 번호 출력)
   for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
     uint8_t master_id = MST_IDS_CAN2[i];
     uint8_t slave_id = SLV_IDS_CAN2[i];
@@ -491,7 +504,7 @@ void setupOffset() {
 }
 
 // -------------------------------------------------------------
-// 10. 메인 루프 구조
+// 10. 메인 루프 구조 (Position-Torque 반력 제어 적용)
 // -------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -499,7 +512,7 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
 
-  Serial.println("=== Robstride Bilateral Teleoperation with Initial Offset ===");
+  Serial.println("=== Robstride Multi-Channel Position-Torque Teleoperation ===");
 
   Can1.begin();
   Can1.setBaudRate(1000000);
@@ -520,6 +533,17 @@ void setup() {
   Serial.println("Teensy CAN1/CAN2 initialized.");
   delay(1000);
 
+  // 마스터 및 슬레이브 전체 활성화
+  for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
+    enableMotorCan1(MST_IDS_CAN1[i]); delay(20);
+    enableMotorCan1(SLV_IDS_CAN1[i]); delay(20);
+  }
+
+  for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
+    enableMotorCan2(MST_IDS_CAN2[i]); delay(20);
+    enableMotorCan2(SLV_IDS_CAN2[i]); delay(20);
+  }
+
   setupOffset();
   controlTimer = 0;
 }
@@ -528,74 +552,58 @@ void loop() {
   Can1.events();
   Can2.events();
 
+  // CAN1 진단 로그 출력
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     uint8_t ids[2] = {MST_IDS_CAN1[i], SLV_IDS_CAN1[i]};
-
     for (int j = 0; j < 2; j++) {
       uint8_t motor_id = ids[j];
-
       if (fault_changed_can1[motor_id]) {
         noInterrupts();
         uint8_t fault = fault_bits_can1[motor_id];
         fault_changed_can1[motor_id] = false;
         interrupts();
-
         printFaultBits("CAN1", motor_id, fault);
       }
-
       if (position_wrap_can1[motor_id]) {
         noInterrupts();
         position_wrap_can1[motor_id] = false;
         interrupts();
-
-        Serial.printf("[CAN1 WRAP] Motor %d position crossed P_MIN/P_MAX boundary\r\n",
-                      motor_id);
+        Serial.printf("[CAN1 WRAP] Motor %d position crossed P_MIN/P_MAX boundary\r\n", motor_id);
       }
-
       if (position_jump_can1[motor_id]) {
         noInterrupts();
         float delta = position_jump_delta_can1[motor_id];
         position_jump_can1[motor_id] = false;
         interrupts();
-
-        Serial.printf("[CAN1 JUMP] Motor %d unexpected position delta: %.3f rad\r\n",
-                      motor_id, delta);
+        Serial.printf("[CAN1 JUMP] Motor %d unexpected position delta: %.3f rad\r\n", motor_id, delta);
       }
     }
   }
 
+  // CAN2 진단 로그 출력
   for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
     uint8_t ids[2] = {MST_IDS_CAN2[i], SLV_IDS_CAN2[i]};
-
     for (int j = 0; j < 2; j++) {
       uint8_t motor_id = ids[j];
-
       if (fault_changed_can2[motor_id]) {
         noInterrupts();
         uint8_t fault = fault_bits_can2[motor_id];
         fault_changed_can2[motor_id] = false;
         interrupts();
-
         printFaultBits("CAN2", motor_id, fault);
       }
-
       if (position_wrap_can2[motor_id]) {
         noInterrupts();
         position_wrap_can2[motor_id] = false;
         interrupts();
-
-        Serial.printf("[CAN2 WRAP] Motor %d position crossed P_MIN/P_MAX boundary\r\n",
-                      motor_id);
+        Serial.printf("[CAN2 WRAP] Motor %d position crossed P_MIN/P_MAX boundary\r\n", motor_id);
       }
-
       if (position_jump_can2[motor_id]) {
         noInterrupts();
         float delta = position_jump_delta_can2[motor_id];
         position_jump_can2[motor_id] = false;
         interrupts();
-
-        Serial.printf("[CAN2 JUMP] Motor %d unexpected position delta: %.3f rad\r\n",
-                      motor_id, delta);
+        Serial.printf("[CAN2 JUMP] Motor %d unexpected position delta: %.3f rad\r\n", motor_id, delta);
       }
     }
   }
@@ -610,63 +618,71 @@ void loop() {
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
-    // 양방향 제어 게인 설정
-    float master_kp = KP; // 상단 전역 변수 (3.0f)
-    float master_kd = KD; // 상단 전역 변수 (0.0f)
-    float slave_kp  = 25.0f;
-    float slave_kd  = 1.0f;
+    float slave_kp = 25.0f;
+    float slave_kd = 1.0f;
 
-    // --- CAN1 양방향 제어 ---
+    // --- CAN1 제어 ---
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
       if (offset_ready_can1[i]) {
-        // 양방향 제어: 마스터는 슬레이브 위치를 추적, 슬레이브는 마스터 위치를 추적
-        float master_target_pos = wrapPosition(slave_pos_can1[i] - pos_offset_can1[i]);
-        float slave_target_pos  = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
-
-        operationControlCan1(MST_IDS_CAN1[i], 0.0f, master_target_pos, 0.0f, master_kp, master_kd);
+        // 1. 슬레이브: 마스터 위치 추종
+        float slave_target_pos = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
+
+        // 2. 마스터: 위치 제어(Kp=0) 끄고, 슬레이브 외력 토크 반력 피드백 인가
+        float filtered_trq = processTorqueDeadzone(slave_trq_can1[i], TORQUE_DEADZONE_NM);
+        float feedback_torque = -1.0f * filtered_trq * TORQUE_FEEDBACK_GAIN;
+
+        operationControlCan1(MST_IDS_CAN1[i], feedback_torque, 0.0f, 0.0f, 0.0f, 0.0f);
       } else {
         operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
       }
     }
 
-    // --- CAN2 양방향 제어 ---
+    // --- CAN2 제어 ---
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
       if (offset_ready_can2[i]) {
-        float master_target_pos = wrapPosition(slave_pos_can2[i] - pos_offset_can2[i]);
-        float slave_target_pos  = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
-
-        operationControlCan2(MST_IDS_CAN2[i], 0.0f, master_target_pos, 0.0f, master_kp, master_kd);
+        // 1. 슬레이브: 마스터 위치 추종
+        float slave_target_pos = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
         operationControlCan2(SLV_IDS_CAN2[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
+
+        // 2. 마스터: 위치 제어(Kp=0) 끄고, 슬레이브 외력 토크 반력 피드백 인가
+        float filtered_trq = processTorqueDeadzone(slave_trq_can2[i], TORQUE_DEADZONE_NM);
+        float feedback_torque = -1.0f * filtered_trq * TORQUE_FEEDBACK_GAIN;
+
+        operationControlCan2(MST_IDS_CAN2[i], feedback_torque, 0.0f, 0.0f, 0.0f, 0.0f);
       } else {
         operationControlCan2(MST_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
         operationControlCan2(SLV_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
       }
     }
 
-    // 500ms마다 상태 모니터링 출력
+    // 500ms마다 상태 모니터링 및 토크 출력
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint >= 500) {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-        float master_target_pos = wrapPosition(slave_pos_can1[i] - pos_offset_can1[i]);
-        float slave_target_pos  = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
-        Serial.printf("[CAN1] Master %d Pos: %.3f (Tgt: %.3f) | Slave %d Pos: %.3f (Tgt: %.3f) | Offset: %.3f (%s)\r\n",
-                      MST_IDS_CAN1[i], master_pos_can1[i], master_target_pos,
+        float slave_target_pos = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
+        float filtered_trq = processTorqueDeadzone(slave_trq_can1[i], TORQUE_DEADZONE_NM);
+        float feedback_torque = -1.0f * filtered_trq * TORQUE_FEEDBACK_GAIN;
+
+        Serial.printf("[CAN1 P-T] Mst %d Pos: %.3f rad | Slv %d Pos: %.3f rad (Tgt: %.3f) | Slv Trq: %.2f Nm | FB Trq: %.2f Nm (%s)\r\n",
+                      MST_IDS_CAN1[i], master_pos_can1[i],
                       SLV_IDS_CAN1[i], slave_pos_can1[i], slave_target_pos,
-                      pos_offset_can1[i],
+                      slave_trq_can1[i], feedback_torque,
                       offset_ready_can1[i] ? "READY" : "NOT READY");
       }
 
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-        float master_target_pos = wrapPosition(slave_pos_can2[i] - pos_offset_can2[i]);
-        float slave_target_pos  = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
-        Serial.printf("[CAN2] Master %d Pos: %.3f (Tgt: %.3f) | Slave %d Pos: %.3f (Tgt: %.3f) | Offset: %.3f (%s)\r\n",
-                      MST_IDS_CAN2[i], master_pos_can2[i], master_target_pos,
+        float slave_target_pos = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
+        float filtered_trq = processTorqueDeadzone(slave_trq_can2[i], TORQUE_DEADZONE_NM);
+        float feedback_torque = -1.0f * filtered_trq * TORQUE_FEEDBACK_GAIN;
+
+        Serial.printf("[CAN2 P-T] Mst %d Pos: %.3f rad | Slv %d Pos: %.3f rad (Tgt: %.3f) | Slv Trq: %.2f Nm | FB Trq: %.2f Nm (%s)\r\n",
+                      MST_IDS_CAN2[i], master_pos_can2[i],
                       SLV_IDS_CAN2[i], slave_pos_can2[i], slave_target_pos,
-                      pos_offset_can2[i],
+                      slave_trq_can2[i], feedback_torque,
                       offset_ready_can2[i] ? "READY" : "NOT READY");
       }
 
@@ -696,7 +712,6 @@ void serialEvent() {
       Serial.println("[Teensy] All Motors Disabled.");
 
     } else if (ch == 'e' || ch == 'E') {
-      // 양방향 제어를 위해 마스터 모터와 슬레이브 모터를 모두 활성화
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
         enableMotorCan1(MST_IDS_CAN1[i]); delay(20);
         enableMotorCan1(SLV_IDS_CAN1[i]); delay(20);
