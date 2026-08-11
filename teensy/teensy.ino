@@ -6,12 +6,12 @@
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
 const uint8_t NUM_MOTORS_CAN1 = 2;
-const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1] = {1, 2};
-const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1] = {11, 12};
+const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 2};
+const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {11, 12};
 
-const uint8_t NUM_MOTORS_CAN2 = 2;
-const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2] = {3, 4};
-const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2] = {13, 14};
+const uint8_t NUM_MOTORS_CAN2 = 0;
+const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {};
+const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {};
 
 const uint8_t HOST_ID = 253;
 
@@ -44,26 +44,28 @@ elapsedMicros controlTimer;
 const float POSITION_JUMP_MARGIN_RAD = 0.20f;
 
 // -------------------------------------------------------------
-// 4. 실시간 상태 및 오프셋 변수
+// 4. 실시간 상태 및 오프셋 변수 (가변 크기 대응)
 // -------------------------------------------------------------
-volatile float master_pos_can1[NUM_MOTORS_CAN1] = {0.0f, 0.0f};
-volatile float slave_pos_can1[NUM_MOTORS_CAN1]  = {0.0f, 0.0f};
-float pos_offset_can1[NUM_MOTORS_CAN1]          = {0.0f, 0.0f};
+#define SAFE_BUF_SIZE(n) ((n) > 0 ? (n) : 1)
 
-volatile float master_pos_can2[NUM_MOTORS_CAN2] = {0.0f, 0.0f};
-volatile float slave_pos_can2[NUM_MOTORS_CAN2]  = {0.0f, 0.0f};
-float pos_offset_can2[NUM_MOTORS_CAN2]          = {0.0f, 0.0f};
+volatile float master_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
+volatile float slave_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
+float pos_offset_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]          = {};
 
-// 추가: 오프셋 계산 전 새 피드백 수신 여부 확인
-volatile bool master_valid_can1[NUM_MOTORS_CAN1] = {false, false};
-volatile bool slave_valid_can1[NUM_MOTORS_CAN1]  = {false, false};
-volatile bool master_valid_can2[NUM_MOTORS_CAN2] = {false, false};
-volatile bool slave_valid_can2[NUM_MOTORS_CAN2]  = {false, false};
+volatile float master_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
+volatile float slave_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
+float pos_offset_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]          = {};
 
-bool offset_ready_can1[NUM_MOTORS_CAN1] = {false, false};
-bool offset_ready_can2[NUM_MOTORS_CAN2] = {false, false};
+// 오프셋 계산 전 새 피드백 수신 여부 확인
+volatile bool master_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
+volatile bool slave_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
+volatile bool master_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
+volatile bool slave_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 
-// 추가: Type 2 피드백의 fault 및 mode 상태 저장
+bool offset_ready_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
+bool offset_ready_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
+
+// Type 2 피드백의 fault 및 mode 상태 저장 (전체 ID 0~255 매핑)
 volatile uint8_t fault_bits_can1[256] = {0};
 volatile uint8_t fault_bits_can2[256] = {0};
 volatile uint8_t motor_mode_can1[256] = {0};
@@ -71,7 +73,7 @@ volatile uint8_t motor_mode_can2[256] = {0};
 volatile bool fault_changed_can1[256] = {false};
 volatile bool fault_changed_can2[256] = {false};
 
-// 추가: 위치 점프 및 위치 범위 순환 감시
+// 위치 점프 및 위치 범위 순환 감시
 volatile bool position_initialized_can1[256] = {false};
 volatile bool position_initialized_can2[256] = {false};
 volatile float previous_position_can1[256] = {0.0f};
@@ -98,7 +100,6 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
   return x_min + (float)x * (x_max - x_min) / 65535.0f;
 }
 
-// 추가: 목표 위치가 프로토콜 위치 범위를 넘어가면 같은 주기의 위치로 환산
 float wrapPosition(float pos) {
   const float range = P_MAX - P_MIN;
 
@@ -108,7 +109,6 @@ float wrapPosition(float pos) {
   return pos;
 }
 
-// 추가: Type 2 피드백에 포함된 fault 상태 출력
 void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) {
   Serial.printf("[%s FAULT] Motor %d | Raw: 0x%02X", can_name, motor_id, fault_bits);
 
@@ -127,7 +127,6 @@ void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) 
   Serial.println();
 }
 
-// 추가: 한 피드백 주기에서 물리적으로 설명하기 어려운 위치 점프 감지
 bool checkPositionJump(uint8_t motor_id, float current_pos,
                        volatile bool* initialized,
                        volatile float* previous_position,
@@ -147,7 +146,6 @@ bool checkPositionJump(uint8_t motor_id, float current_pos,
   float raw_delta = current_pos - previous_position[motor_id];
   const float range = P_MAX - P_MIN;
 
-  // 위치 범위 경계 수준의 큰 변화도 표시만 하고 점프 판정에서는 예외 처리하지 않음
   if (raw_delta > range * 0.5f || raw_delta < -range * 0.5f) {
     wrap_flag[motor_id] = true;
   }
@@ -156,12 +154,9 @@ bool checkPositionJump(uint8_t motor_id, float current_pos,
   float dt = (float)dt_us * 1.0e-6f;
   float allowed_delta = V_MAX * dt + POSITION_JUMP_MARGIN_RAD;
 
-  // 변경: 이유와 관계없이 위치 점프로 판정되면 이 패킷을 버림
   if (fabsf(raw_delta) > allowed_delta) {
     jump_delta[motor_id] = raw_delta;
     jump_flag[motor_id] = true;
-
-    // 점프 패킷은 다음 비교 기준에도 저장하지 않음
     return false;
   }
 
@@ -178,15 +173,9 @@ void enableMotorCan1(uint8_t motor_id) {
   mode_msg.flags.extended = 1;
   mode_msg.id = (0x12UL << 24) | ((uint32_t)HOST_ID << 8) | motor_id;
   mode_msg.len = 8;
-
+  memset(mode_msg.buf, 0, 8);
   mode_msg.buf[0] = 0x05;
   mode_msg.buf[1] = 0x70;
-  mode_msg.buf[2] = 0x00;
-  mode_msg.buf[3] = 0x00;
-  mode_msg.buf[4] = 0x00;
-  mode_msg.buf[5] = 0x00;
-  mode_msg.buf[6] = 0x00;
-  mode_msg.buf[7] = 0x00;
 
   Can1.write(mode_msg);
   delay(20);
@@ -195,7 +184,7 @@ void enableMotorCan1(uint8_t motor_id) {
   enable_msg.flags.extended = 1;
   enable_msg.id = (3UL << 24) | ((uint32_t)HOST_ID << 8) | motor_id;
   enable_msg.len = 8;
-  for (int i = 0; i < 8; i++) enable_msg.buf[i] = 0;
+  memset(enable_msg.buf, 0, 8);
 
   Can1.write(enable_msg);
   Serial.printf("[Teensy CAN1] Motor %d Enabled successfully!\r\n", motor_id);
@@ -206,7 +195,7 @@ void disableMotorCan1(uint8_t motor_id) {
   msg.flags.extended = 1;
   msg.id = (4UL << 24) | ((uint32_t)HOST_ID << 8) | motor_id;
   msg.len = 8;
-  for (int i = 0; i < 8; i++) msg.buf[i] = 0;
+  memset(msg.buf, 0, 8);
 
   Can1.write(msg);
   Serial.printf("[Teensy CAN1] Motor %d Disabled.\r\n", motor_id);
@@ -246,15 +235,9 @@ void enableMotorCan2(uint8_t motor_id) {
   mode_msg.flags.extended = 1;
   mode_msg.id = (0x12UL << 24) | ((uint32_t)HOST_ID << 8) | motor_id;
   mode_msg.len = 8;
-
+  memset(mode_msg.buf, 0, 8);
   mode_msg.buf[0] = 0x05;
   mode_msg.buf[1] = 0x70;
-  mode_msg.buf[2] = 0x00;
-  mode_msg.buf[3] = 0x00;
-  mode_msg.buf[4] = 0x00;
-  mode_msg.buf[5] = 0x00;
-  mode_msg.buf[6] = 0x00;
-  mode_msg.buf[7] = 0x00;
 
   Can2.write(mode_msg);
   delay(20);
@@ -263,7 +246,7 @@ void enableMotorCan2(uint8_t motor_id) {
   enable_msg.flags.extended = 1;
   enable_msg.id = (3UL << 24) | ((uint32_t)HOST_ID << 8) | motor_id;
   enable_msg.len = 8;
-  for (int i = 0; i < 8; i++) enable_msg.buf[i] = 0;
+  memset(enable_msg.buf, 0, 8);
 
   Can2.write(enable_msg);
   Serial.printf("[Teensy CAN2] Motor %d Enabled successfully!\r\n", motor_id);
@@ -274,7 +257,7 @@ void disableMotorCan2(uint8_t motor_id) {
   msg.flags.extended = 1;
   msg.id = (4UL << 24) | ((uint32_t)HOST_ID << 8) | motor_id;
   msg.len = 8;
-  for (int i = 0; i < 8; i++) msg.buf[i] = 0;
+  memset(msg.buf, 0, 8);
 
   Can2.write(msg);
   Serial.printf("[Teensy CAN2] Motor %d Disabled.\r\n", motor_id);
@@ -310,12 +293,9 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
 // 8. CAN 수신 인터럽트 콜백
 // -------------------------------------------------------------
 void rxCallbackCan1(const CAN_message_t &msg) {
-  // 추가: Robstride private protocol은 extended CAN frame 사용
-
   uint8_t mode = (msg.id >> 24) & 0x1F;
 
   if (mode == 2) {
-    // 추가: Type 2 피드백은 8Byte만 처리
     uint8_t motor_id = (msg.id >> 8) & 0xFF;
     uint8_t new_fault_bits = (msg.id >> 16) & 0x3F;
     uint8_t new_motor_mode = (msg.id >> 22) & 0x03;
@@ -323,7 +303,6 @@ void rxCallbackCan1(const CAN_message_t &msg) {
     uint16_t p_raw = ((uint16_t)msg.buf[0] << 8) | msg.buf[1];
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
 
-    // 변경: 위치 점프 패킷은 위치/fault/mode/valid 상태에 반영하지 않고 즉시 폐기
     if (!checkPositionJump(motor_id, current_pos,
                            position_initialized_can1,
                            previous_position_can1,
@@ -334,7 +313,6 @@ void rxCallbackCan1(const CAN_message_t &msg) {
       return;
     }
 
-    // 추가: fault/mode 상태 저장, fault 변화 시 메인 루프에서 출력
     if (new_fault_bits != fault_bits_can1[motor_id]) {
       fault_bits_can1[motor_id] = new_fault_bits;
       fault_changed_can1[motor_id] = true;
@@ -356,12 +334,9 @@ void rxCallbackCan1(const CAN_message_t &msg) {
 }
 
 void rxCallbackCan2(const CAN_message_t &msg) {
-  // 추가: Robstride private protocol은 extended CAN frame 사용
-
   uint8_t mode = (msg.id >> 24) & 0x1F;
 
   if (mode == 2) {
-    // 추가: Type 2 피드백은 8Byte만 처리
     uint8_t motor_id = (msg.id >> 8) & 0xFF;
     uint8_t new_fault_bits = (msg.id >> 16) & 0x3F;
     uint8_t new_motor_mode = (msg.id >> 22) & 0x03;
@@ -369,7 +344,6 @@ void rxCallbackCan2(const CAN_message_t &msg) {
     uint16_t p_raw = ((uint16_t)msg.buf[0] << 8) | msg.buf[1];
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
 
-    // 변경: 위치 점프 패킷은 위치/fault/mode/valid 상태에 반영하지 않고 즉시 폐기
     if (!checkPositionJump(motor_id, current_pos,
                            position_initialized_can2,
                            previous_position_can2,
@@ -380,7 +354,6 @@ void rxCallbackCan2(const CAN_message_t &msg) {
       return;
     }
 
-    // 추가: fault/mode 상태 저장, fault 변화 시 메인 루프에서 출력
     if (new_fault_bits != fault_bits_can2[motor_id]) {
       fault_bits_can2[motor_id] = new_fault_bits;
       fault_changed_can2[motor_id] = true;
@@ -405,7 +378,6 @@ void rxCallbackCan2(const CAN_message_t &msg) {
 // 9. 초기 위치 오프셋 측정 헬퍼 함수
 // -------------------------------------------------------------
 void setupOffset() {
-  // 추가: 이전 피드백을 재사용하지 않고 새 응답을 확인
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     master_valid_can1[i] = false;
     slave_valid_can1[i] = false;
@@ -429,19 +401,17 @@ void setupOffset() {
     operationControlCan2(SLV_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
   }
 
-  // 피드백 데이터 수신 대기 (100ms)
   uint32_t waitStart = millis();
   while (millis() - waitStart < 100) {
     Can1.events();
     Can2.events();
   }
 
-  // CAN1 각 쌍별 초기 오프셋 계산
+  // CAN1 오프셋 계산
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     uint8_t master_id = MST_IDS_CAN1[i];
     uint8_t slave_id = SLV_IDS_CAN1[i];
 
-    // 추가: 양쪽 모터의 새 피드백 수신 및 fault 상태 확인 후 계산
     if (!master_valid_can1[i] || !slave_valid_can1[i]) {
       Serial.printf("[SETUP CAN1] Pair %d Offset FAILED: feedback missing "
                     "(Master %d: %s, Slave %d: %s)\r\n",
@@ -477,16 +447,16 @@ void setupOffset() {
                   motor_mode_can1[master_id], motor_mode_can1[slave_id]);
   }
 
-  // CAN2 각 쌍별 초기 오프셋 계산
+  // CAN2 오프셋 계산 (CAN1 개수를 반영하여 Pair 번호 출력)
   for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
     uint8_t master_id = MST_IDS_CAN2[i];
     uint8_t slave_id = SLV_IDS_CAN2[i];
+    int pair_num = i + 1 + NUM_MOTORS_CAN1;
 
-    // 추가: 양쪽 모터의 새 피드백 수신 및 fault 상태 확인 후 계산
     if (!master_valid_can2[i] || !slave_valid_can2[i]) {
       Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: feedback missing "
                     "(Master %d: %s, Slave %d: %s)\r\n",
-                    i + 3,
+                    pair_num,
                     master_id, master_valid_can2[i] ? "OK" : "NO",
                     slave_id, slave_valid_can2[i] ? "OK" : "NO");
       continue;
@@ -495,7 +465,7 @@ void setupOffset() {
     if (fault_bits_can2[master_id] != 0 || fault_bits_can2[slave_id] != 0) {
       Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: motor fault "
                     "(Master %d: 0x%02X, Slave %d: 0x%02X)\r\n",
-                    i + 3,
+                    pair_num,
                     master_id, fault_bits_can2[master_id],
                     slave_id, fault_bits_can2[slave_id]);
       continue;
@@ -503,7 +473,7 @@ void setupOffset() {
 
     if (!isfinite(master_pos_can2[i]) || !isfinite(slave_pos_can2[i])) {
       Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: invalid position value\r\n",
-                    i + 3);
+                    pair_num);
       continue;
     }
 
@@ -512,7 +482,7 @@ void setupOffset() {
 
     Serial.printf("[SETUP CAN2] Pair %d Offset Calculated: %.3f rad "
                   "(Master %d: %.3f, Slave %d: %.3f, Mode %d/%d)\r\n",
-                  i + 3, pos_offset_can2[i],
+                  pair_num, pos_offset_can2[i],
                   master_id, master_pos_can2[i],
                   slave_id, slave_pos_can2[i],
                   motor_mode_can2[master_id], motor_mode_can2[slave_id]);
@@ -529,8 +499,6 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
 
   Serial.println("=== Robstride Unidirectional Teleoperation with Initial Offset ===");
-  Serial.println("CAN1: 1,2 -> 11,12");
-  Serial.println("CAN2: 3,4 -> 13,14");
 
   Can1.begin();
   Can1.setBaudRate(1000000);
@@ -559,7 +527,6 @@ void loop() {
   Can1.events();
   Can2.events();
 
-  // 추가: 수신 콜백에서는 상태만 저장하고 실제 Serial 출력은 메인 루프에서 수행
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     uint8_t ids[2] = {MST_IDS_CAN1[i], SLV_IDS_CAN1[i]};
 
@@ -632,7 +599,6 @@ void loop() {
     }
   }
 
-  // 1초(1000ms)마다 내장 LED 반짝임 (토글)
   static uint32_t lastLedToggle = 0;
   if (millis() - lastLedToggle >= 1000) {
     lastLedToggle = millis();
@@ -646,32 +612,20 @@ void loop() {
     float slave_kp = 25.0f;
     float slave_kd = 1.0f;
 
-    // CAN1: 마스터 1, 2 / 슬레이브 11, 12
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
       operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 
-      // 추가: 정상적으로 계산된 오프셋이 있을 때만 슬레이브 위치 제어
       if (offset_ready_can1[i]) {
-        float slave_target_pos = master_pos_can1[i] + pos_offset_can1[i];
-
-        // 추가: master + offset이 위치 범위를 넘을 경우 주기 범위로 환산
-        slave_target_pos = wrapPosition(slave_target_pos);
-
+        float slave_target_pos = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
       }
     }
 
-    // CAN2: 마스터 3, 4 / 슬레이브 13, 14
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
       operationControlCan2(MST_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 
-      // 추가: 정상적으로 계산된 오프셋이 있을 때만 슬레이브 위치 제어
       if (offset_ready_can2[i]) {
-        float slave_target_pos = master_pos_can2[i] + pos_offset_can2[i];
-
-        // 추가: master + offset이 위치 범위를 넘을 경우 주기 범위로 환산
-        slave_target_pos = wrapPosition(slave_target_pos);
-
+        float slave_target_pos = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
         operationControlCan2(SLV_IDS_CAN2[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
       }
     }
