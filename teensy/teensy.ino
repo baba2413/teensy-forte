@@ -15,6 +15,7 @@ const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {};
 
 const uint8_t HOST_ID = 253;
 
+// 마스터 모터 햅틱 피드백 게인 (양방향 제어용)
 const float KP = 3.0f;
 const float KD = 0.0f;
 
@@ -498,7 +499,7 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
 
-  Serial.println("=== Robstride Unidirectional Teleoperation with Initial Offset ===");
+  Serial.println("=== Robstride Bilateral Teleoperation with Initial Offset ===");
 
   Can1.begin();
   Can1.setBaudRate(1000000);
@@ -609,24 +610,38 @@ void loop() {
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
-    float slave_kp = 25.0f;
-    float slave_kd = 1.0f;
+    // 양방향 제어 게인 설정
+    float master_kp = KP; // 상단 전역 변수 (3.0f)
+    float master_kd = KD; // 상단 전역 변수 (0.0f)
+    float slave_kp  = 25.0f;
+    float slave_kd  = 1.0f;
 
+    // --- CAN1 양방향 제어 ---
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-      operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-
       if (offset_ready_can1[i]) {
-        float slave_target_pos = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
+        // 양방향 제어: 마스터는 슬레이브 위치를 추적, 슬레이브는 마스터 위치를 추적
+        float master_target_pos = wrapPosition(slave_pos_can1[i] - pos_offset_can1[i]);
+        float slave_target_pos  = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
+
+        operationControlCan1(MST_IDS_CAN1[i], 0.0f, master_target_pos, 0.0f, master_kp, master_kd);
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
+      } else {
+        operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        operationControlCan1(SLV_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
       }
     }
 
+    // --- CAN2 양방향 제어 ---
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-      operationControlCan2(MST_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-
       if (offset_ready_can2[i]) {
-        float slave_target_pos = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
+        float master_target_pos = wrapPosition(slave_pos_can2[i] - pos_offset_can2[i]);
+        float slave_target_pos  = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
+
+        operationControlCan2(MST_IDS_CAN2[i], 0.0f, master_target_pos, 0.0f, master_kp, master_kd);
         operationControlCan2(SLV_IDS_CAN2[i], 0.0f, slave_target_pos, 0.0f, slave_kp, slave_kd);
+      } else {
+        operationControlCan2(MST_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        operationControlCan2(SLV_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
       }
     }
 
@@ -636,20 +651,22 @@ void loop() {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-        float slave_target_pos = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
-        Serial.printf("[CAN1] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad "
-                      "(Target: %.3f, Offset: %s)\r\n",
-                      MST_IDS_CAN1[i], master_pos_can1[i],
+        float master_target_pos = wrapPosition(slave_pos_can1[i] - pos_offset_can1[i]);
+        float slave_target_pos  = wrapPosition(master_pos_can1[i] + pos_offset_can1[i]);
+        Serial.printf("[CAN1] Master %d Pos: %.3f (Tgt: %.3f) | Slave %d Pos: %.3f (Tgt: %.3f) | Offset: %.3f (%s)\r\n",
+                      MST_IDS_CAN1[i], master_pos_can1[i], master_target_pos,
                       SLV_IDS_CAN1[i], slave_pos_can1[i], slave_target_pos,
+                      pos_offset_can1[i],
                       offset_ready_can1[i] ? "READY" : "NOT READY");
       }
 
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-        float slave_target_pos = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
-        Serial.printf("[CAN2] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad "
-                      "(Target: %.3f, Offset: %s)\r\n",
-                      MST_IDS_CAN2[i], master_pos_can2[i],
+        float master_target_pos = wrapPosition(slave_pos_can2[i] - pos_offset_can2[i]);
+        float slave_target_pos  = wrapPosition(master_pos_can2[i] + pos_offset_can2[i]);
+        Serial.printf("[CAN2] Master %d Pos: %.3f (Tgt: %.3f) | Slave %d Pos: %.3f (Tgt: %.3f) | Offset: %.3f (%s)\r\n",
+                      MST_IDS_CAN2[i], master_pos_can2[i], master_target_pos,
                       SLV_IDS_CAN2[i], slave_pos_can2[i], slave_target_pos,
+                      pos_offset_can2[i],
                       offset_ready_can2[i] ? "READY" : "NOT READY");
       }
 
@@ -679,11 +696,14 @@ void serialEvent() {
       Serial.println("[Teensy] All Motors Disabled.");
 
     } else if (ch == 'e' || ch == 'E') {
+      // 양방향 제어를 위해 마스터 모터와 슬레이브 모터를 모두 활성화
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
+        enableMotorCan1(MST_IDS_CAN1[i]); delay(20);
         enableMotorCan1(SLV_IDS_CAN1[i]); delay(20);
       }
 
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
+        enableMotorCan2(MST_IDS_CAN2[i]); delay(20);
         enableMotorCan2(SLV_IDS_CAN2[i]); delay(20);
       }
 
