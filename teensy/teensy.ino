@@ -10,18 +10,15 @@
 // -------------------------------------------------------------
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
-const uint8_t NUM_MOTORS_CAN1 = 2; // 필요에 따라 2 등으로 수정
+const uint8_t NUM_MOTORS_CAN1 = 2; 
 const uint8_t MST_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {127, 2};
 const uint8_t SLV_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {1, 12};
 
-const uint8_t NUM_MOTORS_CAN2 = 2; // 필요에 따라 2 등으로 수정
+const uint8_t NUM_MOTORS_CAN2 = 2; 
 const uint8_t MST_IDS_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {3, 4};
 const uint8_t SLV_IDS_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {13, 14};
 
 const uint8_t HOST_ID = 253;
-
-const float KP = 3.0f;
-const float KD = 0.0f;
 
 // Teensy 4.0/4.1 CAN1, CAN2
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
@@ -46,12 +43,8 @@ const float T_MIN = -18.0f;
 const float T_MAX = 18.0f;
 
 // -------------------------------------------------------------
-// 3. 수정된 관절 회전 가상벽 범위 (Joint Space Limits in Radian)
+// 3. 관절 회전 가상벽 범위 (Joint Space Limits in Radian)
 // -------------------------------------------------------------
-// J1 (Yaw)   : [-2.2086 rad, +2.2086 rad] (기존 2.4086에서 0.2 감소)
-// J2 (Roll)  : [-2.2800 rad, +2.2800 rad] (기존 2.4800에서 0.2 감소)
-// J3 (Pitch) : [-2.3000 rad, +0.1000 rad] (음수 동작, 한계 0.2 감소 및 초기점 +0.1 여유)
-// J4 (Pitch) : [-0.1000 rad, +0.9500 rad] (양수 동작, 한계 0.2 감소 및 초기점 -0.1 여유)
 const float JOINT_LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-1.2f, -1.2f}; 
 const float JOINT_LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.2086f,  2.2800f};
 
@@ -70,7 +63,8 @@ const uint32_t WATCHDOG_TIMEOUT_MS = 100; // 통신 끊김 판정 기준
 const uint32_t CONTROL_PERIOD_US = 2000; // 500 Hz (dt = 0.002초)
 elapsedMicros controlTimer;
 
-const float POSITION_JUMP_MARGIN_RAD = 0.20f;
+const float POSITION_JUMP_MARGIN_RAD = 0.05f; // RX 점프 판정 여유값
+const float MAX_ALLOWED_TX_JUMP_RAD  = 0.50f; // TX 명령어 점프 판정 한계값
 
 // -------------------------------------------------------------
 // 5. 모터 트래커 (롤오버 언랩핑 & 위치점프 분리 구조체)
@@ -99,9 +93,9 @@ volatile float master_raw_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 volatile float slave_raw_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 volatile float slave_trq_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 
-// 'c' 키 및 시퀀스 상태 플래그
-bool is_system_calibrated = false;  // 'c'를 눌러 영점이 잡혔는지 여부
-bool is_system_enabled = false;     // 'e'를 눌러 모터가 켜졌는지 여부
+// 플래그 변수
+bool is_system_calibrated = false;  
+bool is_system_enabled = false;     
 
 float master_zero_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 float slave_zero_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
@@ -128,7 +122,6 @@ volatile uint32_t last_rx_time_slv_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile uint32_t last_rx_time_mst_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 volatile uint32_t last_rx_time_slv_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 
-// 토크 제한용 구조체
 struct MasterTorqueState {
   float current_output_trq = 0.0f;
 };
@@ -149,18 +142,10 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
   return x_min + (float)x * (x_max - x_min) / 65535.0f;
 }
 
-float wrapToMotorRaw(float pos) {
-  const float range = P_MAX - P_MIN; // 25.0f
-  while (pos > P_MAX) pos -= range;
-  while (pos < P_MIN) pos += range;
-  return pos;
-}
-
-// 모터 비활성화 함수 선언 (Fault 처리용)
 void disableMotorCan1(uint8_t motor_id);
 void disableMotorCan2(uint8_t motor_id);
 
-// 언랩핑 & 노이즈 위치점프 분리 감지 함수
+// ★ [수정사항 3 & 5 반영] RX 위치 점프 감지 및 롤오버 보정 순서 정립 함수
 bool updateMotorTracker(uint8_t motor_id, float raw_pos, MotorTracker &tr) {
   uint32_t now_us = micros();
 
@@ -176,32 +161,38 @@ bool updateMotorTracker(uint8_t motor_id, float raw_pos, MotorTracker &tr) {
   float raw_delta = raw_pos - tr.raw_prev;
   int turn_delta = 0;
 
-  // 1. +-4pi 오버플로우(Rollover) 감지
   if (raw_delta < -ROLLOVER_THRESHOLD) {
-    turn_delta = 1;  // +4pi -> -4pi 로 넘어감
+    turn_delta = 1;  
   } else if (raw_delta > ROLLOVER_THRESHOLD) {
-    turn_delta = -1; // -4pi -> +4pi 로 넘어감
+    turn_delta = -1; 
   }
 
-  float motor_step = raw_delta + (float)turn_delta * MOTOR_SPAN_RAD;
+  // 1. turn_count 및 임시 연속 위치 선반영
+  tr.turn_count += turn_delta;
+  float new_continuous_pos = raw_pos + ((float)tr.turn_count * MOTOR_SPAN_RAD);
 
-  // 2. 노이즈 및 위치 점프(Jump) 감지 (범위 밖 패킷 무시)
   float dt = (float)(now_us - tr.last_time_us) * 1.0e-6f;
   if (dt <= 0.0f) dt = 0.001f;
-  float allowed_step = V_MAX * dt + POSITION_JUMP_MARGIN_RAD;
 
-  if (fabsf(motor_step) > allowed_step) {
+  // 2. [수정사항 3] V_CHECK_LIMIT = 18.0f 로 하향 조정 적용
+  const float V_CHECK_LIMIT = 18.0f; 
+  float allowed_step = (V_CHECK_LIMIT * dt) + POSITION_JUMP_MARGIN_RAD;
+
+  float step_diff = new_continuous_pos - tr.continuous_pos;
+
+  // 3. [수정사항 5] 롤오버 보정 후 연속 변위(step_diff) 기반으로 점프 검사
+  if (fabsf(step_diff) > allowed_step) {
+    tr.turn_count -= turn_delta; // Rollback
     tr.jump_flag = true;
-    tr.jump_delta = motor_step;
-    return false; // ★ 이상 수치 패킷 무시 (리턴)
+    tr.jump_delta = step_diff;
+    return false; // RX 패킷 버림
   }
 
   if (turn_delta != 0) {
-    tr.turn_count += turn_delta;
     tr.rollover_flag = true;
   }
 
-  tr.continuous_pos = raw_pos + (float)tr.turn_count * MOTOR_SPAN_RAD;
+  tr.continuous_pos = new_continuous_pos;
   tr.raw_prev = raw_pos;
   tr.last_time_us = now_us;
   return true;
@@ -360,12 +351,10 @@ void rxCallbackCan1(const CAN_message_t &msg) {
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
     float current_trq = uintToFloat(t_raw, T_MIN, T_MAX);
 
-    // 언랩핑 및 범위 밖 위치 점프 패킷 무시
     if (!updateMotorTracker(motor_id, current_pos, tracker_can1[motor_id])) {
-      return; // 이상 패킷 데이터 무시
+      return; 
     }
 
-    // ★ Fault 발생 시 자동 Disable 처리 (Req 7)
     if (new_fault_bits != 0) {
       disableMotorCan1(motor_id);
     }
@@ -411,7 +400,6 @@ void rxCallbackCan2(const CAN_message_t &msg) {
       return;
     }
 
-    // ★ Fault 발생 시 자동 Disable 처리 (Req 7)
     if (new_fault_bits != 0) {
       disableMotorCan2(motor_id);
     }
@@ -478,12 +466,12 @@ void calibrateJointZero() {
                   m_id, s_id, master_zero_can2[i], slave_zero_can2[i]);
   }
 
-  is_system_calibrated = true; // 영점 설정 완료
+  is_system_calibrated = true; 
   Serial.println("[CALIBRATION] Complete! Ready to Enable ('e').\n");
 }
 
 // -------------------------------------------------------------
-// 10. 관절 공간(Joint Space) 기반 연동 제어 및 가상벽
+// 10. 관절 공간 기반 연동 제어 (★ 핵심 수정 1, 2, 4 반영)
 // -------------------------------------------------------------
 void controlJointPair(uint8_t pair_idx, uint8_t mst_id, uint8_t slv_id,
                       float j_min, float j_max,
@@ -506,9 +494,11 @@ void controlJointPair(uint8_t pair_idx, uint8_t mst_id, uint8_t slv_id,
   }
 
   MotorTracker &mst_tr = is_can1 ? tracker_can1[mst_id] : tracker_can2[mst_id];
+  MotorTracker &slv_tr = is_can1 ? tracker_can1[slv_id] : tracker_can2[slv_id];
 
   float mst_zero = is_can1 ? master_zero_can1[pair_idx] : master_zero_can2[pair_idx];
   float slv_zero = is_can1 ? slave_zero_can1[pair_idx]  : slave_zero_can2[pair_idx];
+  float slv_raw  = is_can1 ? slave_raw_can1[pair_idx]   : slave_raw_can2[pair_idx];
 
   // 1. 관절 상대 각도 연산
   float q_master = (mst_tr.continuous_pos - mst_zero) / GEAR_RATIO;
@@ -526,22 +516,11 @@ void controlJointPair(uint8_t pair_idx, uint8_t mst_id, uint8_t slv_id,
     limit_penetration = q_slave_target - j_min;
   }
 
-  // 3. 모터 생 수치 역변환 및 Wrap
-  float motor_target_cont = slv_zero + (q_slave_clamped * GEAR_RATIO);
-  float motor_target_raw  = wrapToMotorRaw(motor_target_cont);
-
-  // 4. 슬레이브 제어 명령 송신
-  float slave_kp = 25.0f;
-  float slave_kd = 1.0f;
+  // =========================================================
+  // ★ [수정사항 2 반영] 마스터 가상벽 반력 연산 및 전송을 상단에 우선 실행
+  // (슬레이브 명령 처리 상태와 상관없이 손끝 반력은 무조건 독립적으로 구동됨)
+  // =========================================================
   float slv_trq = is_can1 ? slave_trq_can1[pair_idx] : slave_trq_can2[pair_idx];
-
-  if (is_can1) {
-    operationControlCan1(slv_id, 0.0f, motor_target_raw, 0.0f, slave_kp, slave_kd);
-  } else {
-    operationControlCan2(slv_id, 0.0f, motor_target_raw, 0.0f, slave_kp, slave_kd);
-  }
-
-  // 5. 마스터 반력 연산 및 가상벽 추가
   float master_trq = processSlaveTorqueSafety(slv_trq, trq_state);
 
   if (limit_penetration != 0.0f) {
@@ -551,11 +530,44 @@ void controlJointPair(uint8_t pair_idx, uint8_t mst_id, uint8_t slv_id,
   if (master_trq > MAX_SAFE_TORQUE)  master_trq = MAX_SAFE_TORQUE;
   if (master_trq < -MAX_SAFE_TORQUE) master_trq = -MAX_SAFE_TORQUE;
 
-  // 6. 마스터 모터 토크 송신
   if (is_can1) {
     operationControlCan1(mst_id, master_trq, 0.0f, 0.0f, 0.0f, MASTER_KD);
   } else {
     operationControlCan2(mst_id, master_trq, 0.0f, 0.0f, 0.0f, MASTER_KD);
+  }
+
+  // =========================================================
+  // ★ [수정사항 1 반영] wrapToMotorRaw(+25) 전면 삭제 -> 상대 오차 추종 교체
+  // =========================================================
+  float target_motor_cont = slv_zero + (q_slave_clamped * GEAR_RATIO);
+  float pos_error = target_motor_cont - slv_tr.continuous_pos;
+
+  // 2ms(1주기) 당 이동량을 최대 0.05 rad(약 2.8도)로 안전 제한
+  pos_error = max(-0.05f, min(pos_error, 0.05f));
+
+  // 최종 송신 목표 위치 = 슬레이브 모터 현재 생 수치(slv_raw) + 안전 미세 오차
+  float safe_p_des = slv_raw + pos_error;
+
+  // TX 극심위치오차 로깅/폐기 안전 방어막
+  float tx_jump_delta = fabsf(safe_p_des - slv_raw);
+  if (tx_jump_delta > MAX_ALLOWED_TX_JUMP_RAD) {
+    static uint32_t last_tx_log = 0;
+    if (millis() - last_tx_log > 100) {
+      last_tx_log = millis();
+      Serial.printf("[%s TX DISCARDED] SLV_ID:%d | Extreme Jump: %.3f rad (Target: %.3f, Curr: %.3f)\r\n",
+                    is_can1 ? "CAN1" : "CAN2", slv_id, tx_jump_delta, safe_p_des, slv_raw);
+    }
+    return; // 이상 TX 발생 시 슬레이브 명령만 차단
+  }
+
+  // ★ [수정사항 4 반영] 슬레이브 Kp = 5.0f, Kd = 0.5f 로 하향 조정
+  float slave_kp = 5.0f;
+  float slave_kd = 0.5f;
+
+  if (is_can1) {
+    operationControlCan1(slv_id, 0.0f, safe_p_des, 0.0f, slave_kp, slave_kd);
+  } else {
+    operationControlCan2(slv_id, 0.0f, safe_p_des, 0.0f, slave_kp, slave_kd);
   }
 }
 
@@ -580,7 +592,6 @@ void setup() {
   Serial.println("CAN Controllers Initialized.");
   delay(500);
 
-  // ★ 시작 시 모터를 Enable 하지 않음 (Req 5)
   Serial.println("\n-----------------------------------------------------------");
   Serial.println("[STEP 1] Manually align robot arms to center/initial pose.");
   Serial.println("[STEP 2] Press 'c' to Calibrate Zero Reference.");
@@ -594,7 +605,7 @@ void loop() {
   Can1.events();
   Can2.events();
 
-  // 1. Fault, Rollover, Jump 상태 진단 로깅 (Req 4)
+  // RX 상태 진단 로깅
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     uint8_t ids[2] = {MST_IDS_CAN1[i], SLV_IDS_CAN1[i]};
     for (int j = 0; j < 2; j++) {
@@ -616,7 +627,7 @@ void loop() {
 
       if (tracker_can1[m_id].jump_flag) {
         tracker_can1[m_id].jump_flag = false;
-        Serial.printf("[CAN1 JUMP DISCARDED] Motor ID: %d | Delta: %.3f rad\r\n",
+        Serial.printf("[CAN1 RX JUMP DISCARDED] Motor ID: %d | Delta: %.3f rad\r\n",
                       m_id, tracker_can1[m_id].jump_delta);
       }
     }
@@ -643,24 +654,21 @@ void loop() {
 
       if (tracker_can2[m_id].jump_flag) {
         tracker_can2[m_id].jump_flag = false;
-        Serial.printf("[CAN2 JUMP DISCARDED] Motor ID: %d | Delta: %.3f rad\r\n",
+        Serial.printf("[CAN2 RX JUMP DISCARDED] Motor ID: %d | Delta: %.3f rad\r\n",
                       m_id, tracker_can2[m_id].jump_delta);
       }
     }
   }
 
-  // 2. LED 토글
   static uint32_t lastLedToggle = 0;
   if (millis() - lastLedToggle >= 1000) {
     lastLedToggle = millis();
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 
-  // 3. 500Hz 실시간 제어 루프
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
-    // Enable 및 Calibrated 상태일 때만 연동 제어 수행
     if (is_system_enabled && is_system_calibrated) {
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
         controlJointPair(i, MST_IDS_CAN1[i], SLV_IDS_CAN1[i],
@@ -675,7 +683,6 @@ void loop() {
       }
     }
 
-    // 4. CAN ID 표시 포함 상태 모니터링 출력 (Req 2)
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint >= LOG_PERIOD) {
       lastPrint = millis();
@@ -712,17 +719,16 @@ void loop() {
 }
 
 // -------------------------------------------------------------
-// 12. 시리얼 명령어 인터럽트 (Req 6)
+// 12. 시리얼 명령어 인터럽트
 // -------------------------------------------------------------
 void serialEvent() {
   if (Serial.available()) {
     char ch = Serial.read();
 
     if (ch == 'c' || ch == 'C') {
-      calibrateJointZero(); // 영점 설정 (is_system_calibrated = true)
+      calibrateJointZero(); 
 
     } else if (ch == 'e' || ch == 'E') {
-      // ★ 'c'를 누르기 전 'e' 수신 시 거부 로직 (Req 6)
       if (!is_system_calibrated) {
         Serial.println("\n[ERROR REJECTED] Cannot Enable! You MUST press 'c' to Calibrate Zero first.\n");
         return;
@@ -749,7 +755,6 @@ void serialEvent() {
         disableMotorCan2(SLV_IDS_CAN2[i]); delay(20);
       }
 
-      // ★ d를 누른 후에는 다시 c -> e 순서로만 작동하도록 초기화 (Req 6)
       is_system_enabled = false;
       is_system_calibrated = false; 
       Serial.println("[SYSTEM] All Motors Disabled. (Calibration reset: Press 'c' then 'e' to restart)");
