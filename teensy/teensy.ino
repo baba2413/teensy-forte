@@ -10,11 +10,11 @@
 // -------------------------------------------------------------
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
-const uint8_t NUM_MOTORS_CAN1 = 1; // 필요에 따라 2 등으로 수정
-const uint8_t MST_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {1, 2};
-const uint8_t SLV_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {11, 12};
+const uint8_t NUM_MOTORS_CAN1 = 2; // 필요에 따라 2 등으로 수정
+const uint8_t MST_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {127, 2};
+const uint8_t SLV_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {1, 12};
 
-const uint8_t NUM_MOTORS_CAN2 = 0; // 필요에 따라 2 등으로 수정
+const uint8_t NUM_MOTORS_CAN2 = 2; // 필요에 따라 2 등으로 수정
 const uint8_t MST_IDS_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {3, 4};
 const uint8_t SLV_IDS_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {13, 14};
 
@@ -27,7 +27,7 @@ const float KD = 0.0f;
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> Can2;
 
-const uint8_t LOG_PERIOD = 1000 // ms
+const uint32_t LOG_PERIOD = 1000; // ms
 
 // -------------------------------------------------------------
 // 2. Robstride 프로토콜 및 감속비 물리적 상수
@@ -52,7 +52,7 @@ const float T_MAX = 18.0f;
 // J2 (Roll)  : [-2.2800 rad, +2.2800 rad] (기존 2.4800에서 0.2 감소)
 // J3 (Pitch) : [-2.3000 rad, +0.1000 rad] (음수 동작, 한계 0.2 감소 및 초기점 +0.1 여유)
 // J4 (Pitch) : [-0.1000 rad, +0.9500 rad] (양수 동작, 한계 0.2 감소 및 초기점 -0.1 여유)
-const float JOINT_LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-2.2086f, -2.2800f}; 
+const float JOINT_LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-1.2f, -1.2f}; 
 const float JOINT_LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.2086f,  2.2800f};
 
 const float JOINT_LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-2.3000f, -0.1000f}; 
