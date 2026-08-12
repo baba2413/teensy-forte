@@ -47,14 +47,15 @@ const float T_MAX = 18.0f;
 const float RAW_LIMIT_MIN = -12.4f;
 const float RAW_LIMIT_MAX = 12.4f;
 
+const uint32_t LOG_PERIOD = 1000;
+const float SLV_KP = 25.0f;
+const float SLV_KD = 1.0f;
+
 // -------------------------------------------------------------
 // 3. 제어 주기 설정 (텔레오퍼레이션용 500 Hz / dt = 0.002초)
 // -------------------------------------------------------------
 const uint32_t CONTROL_PERIOD_US = 2000;
 elapsedMicros controlTimer;
-
-// 위치 점프 판정 여유값
-const float POSITION_JUMP_MARGIN_RAD = 0.20f;
 
 // -------------------------------------------------------------
 // 4. 실시간 상태, 오프셋, 영점 변수 및 제어 플래그
@@ -93,20 +94,6 @@ volatile uint8_t motor_mode_can2[256] = {0};
 volatile bool fault_changed_can1[256] = {false};
 volatile bool fault_changed_can2[256] = {false};
 
-// 위치 점프 및 위치 범위 감시
-volatile bool position_initialized_can1[256] = {false};
-volatile bool position_initialized_can2[256] = {false};
-volatile float previous_position_can1[256] = {0.0f};
-volatile float previous_position_can2[256] = {0.0f};
-volatile uint32_t previous_position_us_can1[256] = {0};
-volatile uint32_t previous_position_us_can2[256] = {0};
-volatile bool position_jump_can1[256] = {false};
-volatile bool position_jump_can2[256] = {false};
-volatile float position_jump_delta_can1[256] = {0.0f};
-volatile float position_jump_delta_can2[256] = {0.0f};
-volatile bool position_wrap_can1[256] = {false};
-volatile bool position_wrap_can2[256] = {false};
-
 // -------------------------------------------------------------
 // 5. 데이터 스케일링 및 진단 헬퍼 함수
 // -------------------------------------------------------------
@@ -136,44 +123,6 @@ void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) 
   if (fault_bits & (1 << 5)) Serial.print(" | UNCALIBRATED");
 
   Serial.println();
-}
-
-bool checkPositionJump(uint8_t motor_id, float current_pos,
-                       volatile bool* initialized,
-                       volatile float* previous_position,
-                       volatile uint32_t* previous_time_us,
-                       volatile bool* jump_flag,
-                       volatile float* jump_delta,
-                       volatile bool* wrap_flag) {
-  uint32_t now_us = micros();
-
-  if (!initialized[motor_id]) {
-    initialized[motor_id] = true;
-    previous_position[motor_id] = current_pos;
-    previous_time_us[motor_id] = now_us;
-    return true;
-  }
-
-  float raw_delta = current_pos - previous_position[motor_id];
-  const float range = P_MAX - P_MIN;
-
-  if (raw_delta > range * 0.5f || raw_delta < -range * 0.5f) {
-    wrap_flag[motor_id] = true;
-  }
-
-  uint32_t dt_us = now_us - previous_time_us[motor_id];
-  float dt = (float)dt_us * 1.0e-6f;
-  float allowed_delta = V_MAX * dt + POSITION_JUMP_MARGIN_RAD;
-
-  if (fabsf(raw_delta) > allowed_delta) {
-    jump_delta[motor_id] = raw_delta;
-    jump_flag[motor_id] = true;
-    return false;
-  }
-
-  previous_position[motor_id] = current_pos;
-  previous_time_us[motor_id] = now_us;
-  return true;
 }
 
 // -------------------------------------------------------------
@@ -326,16 +275,6 @@ void rxCallbackCan1(const CAN_message_t &msg) {
     uint16_t p_raw = ((uint16_t)msg.buf[0] << 8) | msg.buf[1];
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
 
-    if (!checkPositionJump(motor_id, current_pos,
-                           position_initialized_can1,
-                           previous_position_can1,
-                           previous_position_us_can1,
-                           position_jump_can1,
-                           position_jump_delta_can1,
-                           position_wrap_can1)) {
-      return;
-    }
-
     if (new_fault_bits != fault_bits_can1[motor_id]) {
       fault_bits_can1[motor_id] = new_fault_bits;
       fault_changed_can1[motor_id] = true;
@@ -366,16 +305,6 @@ void rxCallbackCan2(const CAN_message_t &msg) {
 
     uint16_t p_raw = ((uint16_t)msg.buf[0] << 8) | msg.buf[1];
     float current_pos = uintToFloat(p_raw, P_MIN, P_MAX);
-
-    if (!checkPositionJump(motor_id, current_pos,
-                           position_initialized_can2,
-                           previous_position_can2,
-                           previous_position_us_can2,
-                           position_jump_can2,
-                           position_jump_delta_can2,
-                           position_wrap_can2)) {
-      return;
-    }
 
     if (new_fault_bits != fault_bits_can2[motor_id]) {
       fault_bits_can2[motor_id] = new_fault_bits;
@@ -617,25 +546,6 @@ void loop() {
 
         printFaultBits("CAN1", motor_id, fault);
       }
-
-      if (position_wrap_can1[motor_id]) {
-        noInterrupts();
-        position_wrap_can1[motor_id] = false;
-        interrupts();
-
-        Serial.printf("[CAN1 WRAP] Motor %d position crossed P_MIN/P_MAX boundary\r\n",
-                      motor_id);
-      }
-
-      if (position_jump_can1[motor_id]) {
-        noInterrupts();
-        float delta = position_jump_delta_can1[motor_id];
-        position_jump_can1[motor_id] = false;
-        interrupts();
-
-        Serial.printf("[CAN1 JUMP] Motor %d unexpected position delta: %.3f rad\r\n",
-                      motor_id, delta);
-      }
     }
   }
 
@@ -653,25 +563,6 @@ void loop() {
 
         printFaultBits("CAN2", motor_id, fault);
       }
-
-      if (position_wrap_can2[motor_id]) {
-        noInterrupts();
-        position_wrap_can2[motor_id] = false;
-        interrupts();
-
-        Serial.printf("[CAN2 WRAP] Motor %d position crossed P_MIN/P_MAX boundary\r\n",
-                      motor_id);
-      }
-
-      if (position_jump_can2[motor_id]) {
-        noInterrupts();
-        float delta = position_jump_delta_can2[motor_id];
-        position_jump_can2[motor_id] = false;
-        interrupts();
-
-        Serial.printf("[CAN2 JUMP] Motor %d unexpected position delta: %.3f rad\r\n",
-                      motor_id, delta);
-      }
     }
   }
 
@@ -688,8 +579,8 @@ void loop() {
     // 양방향 제어 게인 설정
     float master_kp = KP; // 전역 변수 (3.0f)
     float master_kd = KD; // 전역 변수 (0.0f)
-    float slave_kp  = 25.0f;
-    float slave_kd  = 1.0f;
+    float slave_kp  = SLV_KP;
+    float slave_kd  = SLV_KD;
 
     // --- CAN1 양방향 제어 ---
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
@@ -741,9 +632,8 @@ void loop() {
       }
     }
 
-    // 500ms마다 상태 모니터링 출력
     static uint32_t lastPrint = 0;
-    if (millis() - lastPrint >= 500) {
+    if (millis() - lastPrint >= LOG_PERIOD) {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
