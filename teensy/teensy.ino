@@ -51,11 +51,14 @@ const float JOINT_LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.2086f,  2
 const float JOINT_LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-2.3000f, -0.1000f}; 
 const float JOINT_LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 0.1000f,  0.9500f};
 
-// 안전 및 왓치독 파라미터
+// 안전 및 파라미터
 const float MAX_SAFE_TORQUE = 2.0f;       // 작업자 보호용 최대 마스터 피드백 토크 (Nm)
 const float K_WALL = 12.0f;               // 가상벽 반발 강도 (Nm/rad)
 const float MASTER_KD = 0.0f;            // 마스터 모터 능동 댐핑
 const uint32_t WATCHDOG_TIMEOUT_MS = 100; // 통신 끊김 판정 기준
+const float SLV_KP = 25.0f;
+const float SLV_KD = 1.0f;
+const float V_CHECK_LIMIT = 45.0f; 
 
 // -------------------------------------------------------------
 // 4. 제어 주기 및 위치 점프 여유값
@@ -175,7 +178,6 @@ bool updateMotorTracker(uint8_t motor_id, float raw_pos, MotorTracker &tr) {
   if (dt <= 0.0f) dt = 0.001f;
 
   // 2. [수정사항 3] V_CHECK_LIMIT = 18.0f 로 하향 조정 적용
-  const float V_CHECK_LIMIT = 18.0f; 
   float allowed_step = (V_CHECK_LIMIT * dt) + POSITION_JUMP_MARGIN_RAD;
 
   float step_diff = new_continuous_pos - tr.continuous_pos;
@@ -561,8 +563,8 @@ void controlJointPair(uint8_t pair_idx, uint8_t mst_id, uint8_t slv_id,
   }
 
   // ★ [수정사항 4 반영] 슬레이브 Kp = 5.0f, Kd = 0.5f 로 하향 조정
-  float slave_kp = 5.0f;
-  float slave_kd = 0.5f;
+  float slave_kp = SLV_KP;
+  float slave_kd = SLV_KD;
 
   if (is_can1) {
     operationControlCan1(slv_id, 0.0f, safe_p_des, 0.0f, slave_kp, slave_kd);
