@@ -30,7 +30,7 @@ const uint32_t LOG_PERIOD = 1000; // ms
 // 2. Robstride 프로토콜 및 감속비 물리적 상수
 // -------------------------------------------------------------
 const float GEAR_RATIO = 6.0f;              // RS06 / EL05 감속비 (6:1)
-const float MOTOR_SPAN_RAD = 8.0f * M_PI;   // 8pi (약 25.1327 rad) - 오버플로우 보정치
+const float MOTOR_SPAN_RAD = 25.0;   // 8pi (약 25.1327 rad) - 오버플로우 보정치
 const float ROLLOVER_THRESHOLD = 12.0f;     // +-4pi(12.566) 근처 롤오버 임계값
 
 const float P_MIN = -12.5f;
@@ -46,7 +46,7 @@ const float T_MAX = 18.0f;
 // 3. 관절 회전 가상벽 범위 (Joint Space Limits in Radian)
 // -------------------------------------------------------------
 const float JOINT_LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-1.2f, -1.2f}; 
-const float JOINT_LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.2086f,  2.2800f};
+const float JOINT_LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 1.5f,  2.2800f};
 
 const float JOINT_LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-2.3000f, -0.1000f}; 
 const float JOINT_LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 0.1000f,  0.9500f};
@@ -148,7 +148,6 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
 void disableMotorCan1(uint8_t motor_id);
 void disableMotorCan2(uint8_t motor_id);
 
-// ★ [수정사항 3 & 5 반영] RX 위치 점프 감지 및 롤오버 보정 순서 정립 함수
 bool updateMotorTracker(uint8_t motor_id, float raw_pos, MotorTracker &tr) {
   uint32_t now_us = micros();
 
@@ -170,26 +169,27 @@ bool updateMotorTracker(uint8_t motor_id, float raw_pos, MotorTracker &tr) {
     turn_delta = -1; 
   }
 
-  // 1. turn_count 및 임시 연속 위치 선반영
-  tr.turn_count += turn_delta;
-  float new_continuous_pos = raw_pos + ((float)tr.turn_count * MOTOR_SPAN_RAD);
+  // 1. turn_count 및 임시 연속 위치 선반영 (25.0f 적용)
+  int32_t temp_turn_count = tr.turn_count + turn_delta;
+  float new_continuous_pos = raw_pos + ((float)temp_turn_count * MOTOR_SPAN_RAD);
 
   float dt = (float)(now_us - tr.last_time_us) * 1.0e-6f;
   if (dt <= 0.0f) dt = 0.001f;
 
-  // 2. [수정사항 3] V_CHECK_LIMIT = 18.0f 로 하향 조정 적용
-  float allowed_step = (V_CHECK_LIMIT * dt) + POSITION_JUMP_MARGIN_RAD;
+  const float V_CHECK_LIMIT = 25.0f; 
+  float allowed_step = (V_CHECK_LIMIT * dt) + POSITION_JUMP_MARGIN_RAD; // ~0.25 rad
 
   float step_diff = new_continuous_pos - tr.continuous_pos;
 
-  // 3. [수정사항 5] 롤오버 보정 후 연속 변위(step_diff) 기반으로 점프 검사
+  // 2. 점프 검사 (25.0f 스팬 적용으로 롤오버 순간 step_diff가 0 근처가 됨)
   if (fabsf(step_diff) > allowed_step) {
-    tr.turn_count -= turn_delta; // Rollback
     tr.jump_flag = true;
     tr.jump_delta = step_diff;
-    return false; // RX 패킷 버림
+    return false; // 극단적 노이즈 시 버림
   }
 
+  // 3. 검증 통과 시 상태 확정
+  tr.turn_count = temp_turn_count;
   if (turn_delta != 0) {
     tr.rollover_flag = true;
   }
@@ -693,11 +693,16 @@ void loop() {
         uint8_t m_id = MST_IDS_CAN1[i];
         uint8_t s_id = SLV_IDS_CAN1[i];
 
+        // 영점 적용 상대 관절 각도
         float q_mst = (tracker_can1[m_id].continuous_pos - master_zero_can1[i]) / GEAR_RATIO;
         float q_slv = (tracker_can1[s_id].continuous_pos - slave_zero_can1[i]) / GEAR_RATIO;
 
-        Serial.printf("[CAN1 MST_ID:%d / SLV_ID:%d] Joint MST: %.3f rad | Joint SLV: %.3f rad | SLV Trq: %.2f Nm | MST FB: %.2f Nm (%s / %s)\r\n",
-                      m_id, s_id, q_mst, q_slv, slave_trq_can1[i],
+        // 모터 센서 실제 Raw 생 수치 (-12.5 ~ +12.5 rad)
+        float raw_mst = master_raw_can1[i];
+        float raw_slv = slave_raw_can1[i];
+
+        Serial.printf("[CAN1 MST_ID:%d / SLV_ID:%d] Joint MST: %.3f rad (Raw: %.3f) | Joint SLV: %.3f rad (Raw: %.3f) | SLV Trq: %.2f Nm | MST FB: %.2f Nm (%s / %s)\r\n",
+                      m_id, s_id, q_mst, raw_mst, q_slv, raw_slv, slave_trq_can1[i],
                       mst_trq_state_can1[i].current_output_trq,
                       is_system_calibrated ? "CALIB_OK" : "NO_CALIB",
                       is_system_enabled ? "ENABLED" : "DISABLED");
@@ -707,11 +712,16 @@ void loop() {
         uint8_t m_id = MST_IDS_CAN2[i];
         uint8_t s_id = SLV_IDS_CAN2[i];
 
+        // 영점 적용 상대 관절 각도
         float q_mst = (tracker_can2[m_id].continuous_pos - master_zero_can2[i]) / GEAR_RATIO;
         float q_slv = (tracker_can2[s_id].continuous_pos - slave_zero_can2[i]) / GEAR_RATIO;
 
-        Serial.printf("[CAN2 MST_ID:%d / SLV_ID:%d] Joint MST: %.3f rad | Joint SLV: %.3f rad | SLV Trq: %.2f Nm | MST FB: %.2f Nm (%s / %s)\r\n",
-                      m_id, s_id, q_mst, q_slv, slave_trq_can2[i],
+        // 모터 센서 실제 Raw 생 수치 (-12.5 ~ +12.5 rad)
+        float raw_mst = master_raw_can2[i];
+        float raw_slv = slave_raw_can2[i];
+
+        Serial.printf("[CAN2 MST_ID:%d / SLV_ID:%d] Joint MST: %.3f rad (Raw: %.3f) | Joint SLV: %.3f rad (Raw: %.3f) | SLV Trq: %.2f Nm | MST FB: %.2f Nm (%s / %s)\r\n",
+                      m_id, s_id, q_mst, raw_mst, q_slv, raw_slv, slave_trq_can2[i],
                       mst_trq_state_can2[i].current_output_trq,
                       is_system_calibrated ? "CALIB_OK" : "NO_CALIB",
                       is_system_enabled ? "ENABLED" : "DISABLED");
