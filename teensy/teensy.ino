@@ -11,8 +11,8 @@
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
 const uint8_t NUM_MOTORS_CAN1 = 2; 
-const uint8_t MST_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {127, 2};
-const uint8_t SLV_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {1, 12};
+const uint8_t MST_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {1, 2};
+const uint8_t SLV_IDS_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {11, 12};
 
 const uint8_t NUM_MOTORS_CAN2 = 2; 
 const uint8_t MST_IDS_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {3, 4};
@@ -45,8 +45,8 @@ const float T_MAX = 18.0f;
 // -------------------------------------------------------------
 // 3. 관절 회전 가상벽 범위 (Joint Space Limits in Radian)
 // -------------------------------------------------------------
-const float JOINT_LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-1.2f, -1.2f}; 
-const float JOINT_LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 1.5f,  2.2800f};
+const float JOINT_LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-2.2086f, -2.28f}; 
+const float JOINT_LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.2086f,  2.28f};
 
 const float JOINT_LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-2.3000f, -0.1000f}; 
 const float JOINT_LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 0.1000f,  0.9500f};
