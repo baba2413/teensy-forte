@@ -27,6 +27,8 @@ const float KD = 0.0f;
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> Can2;
 
+const uint8_t LOG_PERIOD = 1000 // ms
+
 // -------------------------------------------------------------
 // 2. Robstride 프로토콜 및 감속비 물리적 상수
 // -------------------------------------------------------------
@@ -675,7 +677,7 @@ void loop() {
 
     // 4. CAN ID 표시 포함 상태 모니터링 출력 (Req 2)
     static uint32_t lastPrint = 0;
-    if (millis() - lastPrint >= 500) {
+    if (millis() - lastPrint >= LOG_PERIOD) {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
