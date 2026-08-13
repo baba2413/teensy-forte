@@ -17,16 +17,6 @@ const uint8_t HOST_ID = 253;
 
 #define SAFE_BUF_SIZE(n) ((n) > 0 ? (n) : 1)
 
-// --- CAN1 모터 Pair별 이동 범위 및 제한 사용여부 설정 ---
-const bool USE_LIMIT_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {false, false};  // 페어별 제한 로직 ON/OFF
-const float LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-1.5f, -2.0f}; // 페어별 최소 이동 범위 (영점 기준 음수 rad)
-const float LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.5f,  2.0f}; // 페어별 최대 이동 범위 (영점 기준 양수 rad)
-
-// --- CAN2 모터 Pair별 이동 범위 및 제한 사용여부 설정 ---
-const bool USE_LIMIT_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {false, false};
-const float LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-6.0f, -6.0f};
-const float LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 6.0f,  2.2f};
-
 // 슬레이브 모터 위치 추종 게인
 const float SLV_KP = 24.0f;
 const float SLV_KD = 0.2f;
@@ -71,9 +61,8 @@ elapsedMicros controlTimer;
 const uint32_t LOG_PERIOD = 1000;
 
 // -------------------------------------------------------------
-// 4. 실시간 상태, 오프셋, 영점 변수 및 제어 플래그
+// 4. 실시간 상태, 오프셋 변수 및 제어 플래그
 // -------------------------------------------------------------
-bool system_zeroed = false;  // 'c' 버튼 영점 설정 완료 여부
 bool system_enabled = false; // 'e' 버튼 제어 활성화 여부
 
 volatile float master_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
@@ -99,12 +88,6 @@ struct MasterTorqueState {
 
 MasterTorqueState mst_trq_state_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 MasterTorqueState mst_trq_state_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
-
-// 영점 위치 (Raw Radian 기준)
-volatile float mst_zero_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
-volatile float slv_zero_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
-volatile float mst_zero_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
-volatile float slv_zero_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 
 // 오프셋 계산 전 새 피드백 수신 여부 확인
 volatile bool master_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
@@ -405,66 +388,7 @@ void rxCallbackCan2(const CAN_message_t &msg) {
 }
 
 // -------------------------------------------------------------
-// 9. 영점 설정 함수 ('c' 버튼 동작)
-// -------------------------------------------------------------
-void setZeroPosition() {
-  // 최신 위치 피드백 갱신을 위해 Dummy 명령 전송
-  for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-    operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-    operationControlCan1(SLV_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-  }
-  for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-    operationControlCan2(MST_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-    operationControlCan2(SLV_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-  }
-
-  uint32_t waitStart = millis();
-  while (millis() - waitStart < 100) {
-    Can1.events();
-    Can2.events();
-  }
-
-  Serial.println("\r\n=== Zero Position Set ===");
-  for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-    mst_zero_pos_can1[i] = master_pos_can1[i];
-    slv_zero_pos_can1[i] = slave_pos_can1[i];
-
-    float mst_zeroed = master_pos_can1[i] - mst_zero_pos_can1[i]; // 0.000 rad
-    float slv_zeroed = slave_pos_can1[i] - slv_zero_pos_can1[i]; // 0.000 rad
-
-    Serial.printf("[CAN1 Zero] Master %d: %.3f rad (raw: %.3f) [Limit: %s (%.2f ~ %.2f rad)]\r\n",
-                  MST_IDS_CAN1[i], mst_zeroed, master_pos_can1[i],
-                  USE_LIMIT_CAN1[i] ? "ON" : "OFF",
-                  LIMIT_MIN_CAN1[i], LIMIT_MAX_CAN1[i]);
-    Serial.printf("[CAN1 Zero] Slave %d: %.3f rad (raw: %.3f) [Limit: %s (%.2f ~ %.2f rad)]\r\n",
-                  SLV_IDS_CAN1[i], slv_zeroed, slave_pos_can1[i],
-                  USE_LIMIT_CAN1[i] ? "ON" : "OFF",
-                  LIMIT_MIN_CAN1[i], LIMIT_MAX_CAN1[i]);
-  }
-
-  for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-    mst_zero_pos_can2[i] = master_pos_can2[i];
-    slv_zero_pos_can2[i] = slave_pos_can2[i];
-
-    float mst_zeroed = master_pos_can2[i] - mst_zero_pos_can2[i];
-    float slv_zeroed = slave_pos_can2[i] - slv_zero_pos_can2[i];
-
-    Serial.printf("[CAN2 Zero] Master %d: %.3f rad (raw: %.3f) [Limit: %s (%.2f ~ %.2f rad)]\r\n",
-                  MST_IDS_CAN2[i], mst_zeroed, master_pos_can2[i],
-                  USE_LIMIT_CAN2[i] ? "ON" : "OFF",
-                  LIMIT_MIN_CAN2[i], LIMIT_MAX_CAN2[i]);
-    Serial.printf("[CAN2 Zero] Slave %d: %.3f rad (raw: %.3f) [Limit: %s (%.2f ~ %.2f rad)]\r\n",
-                  SLV_IDS_CAN2[i], slv_zeroed, slave_pos_can2[i],
-                  USE_LIMIT_CAN2[i] ? "ON" : "OFF",
-                  LIMIT_MIN_CAN2[i], LIMIT_MAX_CAN2[i]);
-  }
-
-  system_zeroed = true;
-  Serial.println("Zeroing completed! Now press 'e' to enable motors.\r\n");
-}
-
-// -------------------------------------------------------------
-// 10. 초기 위치 오프셋 측정 헬퍼 함수
+// 9. 초기 위치 오프셋 측정 헬퍼 함수
 // -------------------------------------------------------------
 void setupOffset() {
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
@@ -529,19 +453,6 @@ void setupOffset() {
       continue;
     }
 
-    // 슬레이브가 이미 가상벽 한계 밖에 있는 상태로 Enable 시 급 스냅 방지
-    if (USE_LIMIT_CAN1[i]) {
-      float slv_min = slv_zero_pos_can1[i] + LIMIT_MIN_CAN1[i];
-      float slv_max = slv_zero_pos_can1[i] + LIMIT_MAX_CAN1[i];
-
-      if (slave_pos_can1[i] < slv_min || slave_pos_can1[i] > slv_max) {
-        Serial.printf("[SETUP CAN1] Pair %d Offset FAILED: slave %d already outside limit "
-                      "(pos: %.3f rad, limit: %.2f~%.2f rad) - reposition before enabling\r\n",
-                      i + 1, slave_id, slave_pos_can1[i], slv_min, slv_max);
-        continue;
-      }
-    }
-
     pos_offset_can1[i] = slave_pos_can1[i] - master_pos_can1[i];
     offset_ready_can1[i] = true;
 
@@ -583,19 +494,6 @@ void setupOffset() {
       continue;
     }
 
-    // 슬레이브가 이미 가상벽 한계 밖에 있는 상태로 Enable 시 급 스냅 방지
-    if (USE_LIMIT_CAN2[i]) {
-      float slv_min = slv_zero_pos_can2[i] + LIMIT_MIN_CAN2[i];
-      float slv_max = slv_zero_pos_can2[i] + LIMIT_MAX_CAN2[i];
-
-      if (slave_pos_can2[i] < slv_min || slave_pos_can2[i] > slv_max) {
-        Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: slave %d already outside limit "
-                      "(pos: %.3f rad, limit: %.2f~%.2f rad) - reposition before enabling\r\n",
-                      pair_num, slave_id, slave_pos_can2[i], slv_min, slv_max);
-        continue;
-      }
-    }
-
     pos_offset_can2[i] = slave_pos_can2[i] - master_pos_can2[i];
     offset_ready_can2[i] = true;
 
@@ -609,7 +507,7 @@ void setupOffset() {
 }
 
 // -------------------------------------------------------------
-// 11. 메인 루프 구조
+// 10. 메인 루프 구조
 // -------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -617,7 +515,7 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
 
-  Serial.println("=== Robstride Bilateral Teleoperation with Zeroing & Limits ===");
+  Serial.println("=== Robstride Bilateral Teleoperation ===");
 
   Can1.begin();
   Can1.setBaudRate(1000000);
@@ -636,7 +534,7 @@ void setup() {
   Can2.onReceive(rxCallbackCan2);
 
   Serial.println("Teensy CAN1/CAN2 initialized.");
-  Serial.println("-> Send 'c' to set Zero position before enabling!");
+  Serial.println("-> Send 'e' to enable motors.");
   controlTimer = 0;
 }
 
@@ -702,32 +600,7 @@ void loop() {
         float slave_target_raw = master_pos_can1[i] + pos_offset_can1[i];
         float limit_penetration = 0.0f;
 
-        // 2. 해당 모터 쌍의 제한 로직이 켜진 경우(true)에만 LIMIT_MIN ~ LIMIT_MAX 범위 클램핑
-        if (USE_LIMIT_CAN1[i]) {
-          float min_limit = LIMIT_MIN_CAN1[i];
-          float max_limit = LIMIT_MAX_CAN1[i];
-
-          float slv_min = slv_zero_pos_can1[i] + min_limit;
-          float slv_max = slv_zero_pos_can1[i] + max_limit;
-
-          if (slave_target_raw < slv_min || slave_target_raw > slv_max) {
-            limit_penetration = (slave_target_raw > slv_max) ? (slave_target_raw - slv_max) : (slave_target_raw - slv_min);
-
-            static uint32_t lastLimitWarnMs[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {0};
-            if (millis() - lastLimitWarnMs[i] > 200) {
-              lastLimitWarnMs[i] = millis();
-              Serial.printf("[CAN1 LIMIT] Pair %d Slave %d blocked by limit: target %.3f rad clamped to %.3f rad (%.2f~%.2f)\r\n",
-                            i + 1, SLV_IDS_CAN1[i], slave_target_raw,
-                            slave_target_raw < slv_min ? slv_min : slv_max,
-                            slv_min, slv_max);
-            }
-          }
-
-          if (slave_target_raw < slv_min) slave_target_raw = slv_min;
-          if (slave_target_raw > slv_max) slave_target_raw = slv_max;
-        }
-
-        // 2b. 페어별 제한 설정과 무관하게 항상 적용되는 하드웨어 프로토콜 한계 백스톱
+        // 하드웨어 프로토콜 한계(-12.4~12.4 rad) 가상벽
         if (slave_target_raw < RAW_LIMIT_MIN || slave_target_raw > RAW_LIMIT_MAX) {
           limit_penetration += (slave_target_raw > RAW_LIMIT_MAX) ? (slave_target_raw - RAW_LIMIT_MAX) : (slave_target_raw - RAW_LIMIT_MIN);
 
@@ -770,31 +643,7 @@ void loop() {
         float slave_target_raw = master_pos_can2[i] + pos_offset_can2[i];
         float limit_penetration = 0.0f;
 
-        if (USE_LIMIT_CAN2[i]) {
-          float min_limit = LIMIT_MIN_CAN2[i];
-          float max_limit = LIMIT_MAX_CAN2[i];
-
-          float slv_min = slv_zero_pos_can2[i] + min_limit;
-          float slv_max = slv_zero_pos_can2[i] + max_limit;
-
-          if (slave_target_raw < slv_min || slave_target_raw > slv_max) {
-            limit_penetration = (slave_target_raw > slv_max) ? (slave_target_raw - slv_max) : (slave_target_raw - slv_min);
-
-            static uint32_t lastLimitWarnMs[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {0};
-            if (millis() - lastLimitWarnMs[i] > 200) {
-              lastLimitWarnMs[i] = millis();
-              Serial.printf("[CAN2 LIMIT] Pair %d Slave %d blocked by limit: target %.3f rad clamped to %.3f rad (%.2f~%.2f)\r\n",
-                            i + 1 + NUM_MOTORS_CAN1, SLV_IDS_CAN2[i], slave_target_raw,
-                            slave_target_raw < slv_min ? slv_min : slv_max,
-                            slv_min, slv_max);
-            }
-          }
-
-          if (slave_target_raw < slv_min) slave_target_raw = slv_min;
-          if (slave_target_raw > slv_max) slave_target_raw = slv_max;
-        }
-
-        // 2b. 페어별 제한 설정과 무관하게 항상 적용되는 하드웨어 프로토콜 한계 백스톱
+        // 하드웨어 프로토콜 한계(-12.4~12.4 rad) 가상벽
         if (slave_target_raw < RAW_LIMIT_MIN || slave_target_raw > RAW_LIMIT_MAX) {
           limit_penetration += (slave_target_raw > RAW_LIMIT_MAX) ? (slave_target_raw - RAW_LIMIT_MAX) : (slave_target_raw - RAW_LIMIT_MIN);
 
@@ -833,24 +682,18 @@ void loop() {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-        float master_zeroed = master_pos_can1[i] - mst_zero_pos_can1[i];
-        float slave_zeroed  = slave_pos_can1[i] - slv_zero_pos_can1[i];
-
-        Serial.printf("[CAN1] Master %d Pos: %.3f rad (raw: %.3f) | Slave %d Pos: %.3f rad (raw: %.3f) | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
-                      MST_IDS_CAN1[i], master_zeroed, master_pos_can1[i],
-                      SLV_IDS_CAN1[i], slave_zeroed, slave_pos_can1[i],
+        Serial.printf("[CAN1] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
+                      MST_IDS_CAN1[i], master_pos_can1[i],
+                      SLV_IDS_CAN1[i], slave_pos_can1[i],
                       pos_offset_can1[i],
                       (system_enabled && offset_ready_can1[i]) ? "ENABLED" : "DISABLED",
                       slave_trq_can1[i], mst_trq_state_can1[i].current_output_trq);
       }
 
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-        float master_zeroed = master_pos_can2[i] - mst_zero_pos_can2[i];
-        float slave_zeroed  = slave_pos_can2[i] - slv_zero_pos_can2[i];
-
-        Serial.printf("[CAN2] Master %d Pos: %.3f rad (raw: %.3f) | Slave %d Pos: %.3f rad (raw: %.3f) | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
-                      MST_IDS_CAN2[i], master_zeroed, master_pos_can2[i],
-                      SLV_IDS_CAN2[i], slave_zeroed, slave_pos_can2[i],
+        Serial.printf("[CAN2] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
+                      MST_IDS_CAN2[i], master_pos_can2[i],
+                      SLV_IDS_CAN2[i], slave_pos_can2[i],
                       pos_offset_can2[i],
                       (system_enabled && offset_ready_can2[i]) ? "ENABLED" : "DISABLED",
                       slave_trq_can2[i], mst_trq_state_can2[i].current_output_trq);
@@ -862,22 +705,13 @@ void loop() {
 }
 
 // -------------------------------------------------------------
-// 12. 시리얼 명령 수신 인터럽트
+// 11. 시리얼 명령 수신 인터럽트
 // -------------------------------------------------------------
 void serialEvent() {
   if (Serial.available()) {
     char ch = Serial.read();
 
-    if (ch == 'c' || ch == 'C') {
-      setZeroPosition();
-    } 
-    else if (ch == 'e' || ch == 'E') {
-      // 'c' 키를 누르지 않은 상태에서 'e' 키 입력 차단
-      if (!system_zeroed) {
-        Serial.println("[ERROR] Zero position not set! Press 'c' first before enabling with 'e'.");
-        return;
-      }
-
+    if (ch == 'e' || ch == 'E') {
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
         enableMotorCan1(MST_IDS_CAN1[i]); delay(20);
         enableMotorCan1(SLV_IDS_CAN1[i]); delay(20);
@@ -904,8 +738,7 @@ void serialEvent() {
       }
 
       system_enabled = false;
-      system_zeroed = false; // d를 누른 후에는 영점 재설정 필요
-      Serial.println("[Teensy] All Motors Disabled. Press 'c' then 'e' to run again.");
+      Serial.println("[Teensy] All Motors Disabled. Press 'e' to run again.");
     }
   }
 }
