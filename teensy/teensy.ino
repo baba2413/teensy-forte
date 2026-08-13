@@ -9,9 +9,9 @@ const uint8_t NUM_MOTORS_CAN1 = 2;
 const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 2};
 const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {11, 12};
 
-const uint8_t NUM_MOTORS_CAN2 = 1;
-const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {4};
-const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {14};
+const uint8_t NUM_MOTORS_CAN2 = 2;
+const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {3, 4};
+const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {13, 14};
 
 const uint8_t HOST_ID = 253;
 
@@ -23,15 +23,15 @@ const float LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-1.5f, -2.0f}; // 
 const float LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.5f,  2.0f}; // 페어별 최대 이동 범위 (영점 기준 양수 rad)
 
 // --- CAN2 모터 Pair별 이동 범위 및 제한 사용여부 설정 ---
-const bool USE_LIMIT_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {true};
-const float LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-6.0f};
-const float LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 0.5f};
+const bool USE_LIMIT_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {false, true};
+const float LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-6.0f, -6.0f};
+const float LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 6.0f,  2.2f};
 
 // 마스터 모터 햅틱 피드백 게인 (양방향 제어용)
-const float KP = 3.0f;
+const float KP = 2.0f;
 const float KD = 0.0f;
-const float SLV_KP = 25.0f;
-const float SLV_KD = 1.0f;
+const float SLV_KP = 24.0f;
+const float SLV_KD = 0.2f;
 
 // Teensy 4.0/4.1 CAN1, CAN2 사용
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
@@ -171,6 +171,12 @@ CAN_message_t operationControlCan1(uint8_t motor_id, float feed_forward, float p
 
   // Raw Radian이 -12.4 ~ 12.4 rad 한계를 벗어나는 패킷은 버림
   if (pos < RAW_LIMIT_MIN || pos > RAW_LIMIT_MAX) {
+    static uint32_t lastWarnMs[256] = {0};
+    if (millis() - lastWarnMs[motor_id] > 200) {
+      lastWarnMs[motor_id] = millis();
+      Serial.printf("[CAN1 WARN] Motor %d target %.3f rad OUT OF RANGE (%.1f~%.1f) - command DROPPED\r\n",
+                    motor_id, pos, RAW_LIMIT_MIN, RAW_LIMIT_MAX);
+    }
     return msg;
   }
 
@@ -239,6 +245,12 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
 
   // Raw Radian이 -12.4 ~ 12.4 rad 한계를 벗어나는 패킷은 버림
   if (pos < RAW_LIMIT_MIN || pos > RAW_LIMIT_MAX) {
+    static uint32_t lastWarnMs[256] = {0};
+    if (millis() - lastWarnMs[motor_id] > 200) {
+      lastWarnMs[motor_id] = millis();
+      Serial.printf("[CAN2 WARN] Motor %d target %.3f rad OUT OF RANGE (%.1f~%.1f) - command DROPPED\r\n",
+                    motor_id, pos, RAW_LIMIT_MIN, RAW_LIMIT_MAX);
+    }
     return msg;
   }
 
