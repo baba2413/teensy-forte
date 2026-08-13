@@ -6,22 +6,22 @@
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
 const uint8_t NUM_MOTORS_CAN1 = 2;
-const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 2};
-const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {11, 12};
+const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 3};
+const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {11, 13};
 
 const uint8_t NUM_MOTORS_CAN2 = 2;
-const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {3, 4};
-const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {13, 14};
+const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {2,4};
+const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {12,14};
 
 const uint8_t HOST_ID = 253;
 
 #define SAFE_BUF_SIZE(n) ((n) > 0 ? (n) : 1)
 
 // 마스터 모터 햅틱 피드백 게인 (양방향 제어용)
-const float KP = 2.0f;
-const float KD = 0.0f;
-const float SLV_KP = 24.0f;
-const float SLV_KD = 0.2f;
+const float KP = 10.0f;
+const float KD = 0.1f;
+const float SLV_KP = 10.0f;
+const float SLV_KD = 0.1f;
 
 // Teensy 4.0/4.1 CAN1, CAN2 사용
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
@@ -46,7 +46,7 @@ const float RAW_LIMIT_MAX = 12.4f;
 // -------------------------------------------------------------
 // 3. 제어 주기 설정 (텔레오퍼레이션용 500 Hz / dt = 0.002초)
 // -------------------------------------------------------------
-const uint32_t CONTROL_PERIOD_US = 2000;
+const uint32_t CONTROL_PERIOD_US = 3333;
 elapsedMicros controlTimer;
 
 const uint32_t LOG_PERIOD = 2000;
@@ -533,6 +533,9 @@ void loop() {
         float master_target_raw = slave_pos_can1[i] - pos_offset_can1[i];
         float slave_target_raw  = master_pos_can1[i] + pos_offset_can1[i];
 
+        // TEST
+        master_target_raw = master_pos_can1[i];
+
         operationControlCan1(MST_IDS_CAN1[i], 0.0f, master_target_raw, 0.0f, master_kp, master_kd);
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_raw, 0.0f, slave_kp, slave_kd);
       } else {
@@ -555,9 +558,9 @@ void loop() {
       }
     }
 
-    // 500ms마다 상태 모니터링 출력
+    // 1000ms마다 상태 모니터링 출력
     static uint32_t lastPrint = 0;
-    if (millis() - lastPrint >= 500) {
+    if (millis() - lastPrint >= 1000) {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
