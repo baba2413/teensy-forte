@@ -9,23 +9,29 @@ const uint8_t NUM_MOTORS_CAN1 = 2;
 const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 2};
 const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {11, 12};
 
-const uint8_t NUM_MOTORS_CAN2 = 0;
-const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {};
-const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {};
+const uint8_t NUM_MOTORS_CAN2 = 1;
+const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {4};
+const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {14};
 
 const uint8_t HOST_ID = 253;
 
-// 모터별 영점 기준 허용 이동 범위 (+/- n rad) - 각 모터별 설정 가능
 #define SAFE_BUF_SIZE(n) ((n) > 0 ? (n) : 1)
-const float MST_LIMIT_N_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {2.0f, 2.0f};
-const float SLV_LIMIT_N_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {2.0f, 2.0f};
 
-const float MST_LIMIT_N_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {2.0f};
-const float SLV_LIMIT_N_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {2.0f};
+// --- CAN1 모터 Pair별 이동 범위 및 제한 사용여부 설정 ---
+const bool USE_LIMIT_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {false, false};  // 페어별 제한 로직 ON/OFF
+const float LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-1.5f, -2.0f}; // 페어별 최소 이동 범위 (영점 기준 음수 rad)
+const float LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.5f,  2.0f}; // 페어별 최대 이동 범위 (영점 기준 양수 rad)
+
+// --- CAN2 모터 Pair별 이동 범위 및 제한 사용여부 설정 ---
+const bool USE_LIMIT_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {true};
+const float LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-6.0f};
+const float LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 0.5f};
 
 // 마스터 모터 햅틱 피드백 게인 (양방향 제어용)
 const float KP = 3.0f;
 const float KD = 0.0f;
+const float SLV_KP = 25.0f;
+const float SLV_KD = 1.0f;
 
 // Teensy 4.0/4.1 CAN1, CAN2 사용
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
@@ -47,15 +53,13 @@ const float T_MAX = 18.0f;
 const float RAW_LIMIT_MIN = -12.4f;
 const float RAW_LIMIT_MAX = 12.4f;
 
-const uint32_t LOG_PERIOD = 1000;
-const float SLV_KP = 25.0f;
-const float SLV_KD = 1.0f;
-
 // -------------------------------------------------------------
 // 3. 제어 주기 설정 (텔레오퍼레이션용 500 Hz / dt = 0.002초)
 // -------------------------------------------------------------
 const uint32_t CONTROL_PERIOD_US = 2000;
 elapsedMicros controlTimer;
+
+const uint32_t LOG_PERIOD = 2000;
 
 // -------------------------------------------------------------
 // 4. 실시간 상태, 오프셋, 영점 변수 및 제어 플래그
@@ -346,7 +350,7 @@ void setZeroPosition() {
     Can2.events();
   }
 
-  Serial.println("\r\n=== Zero Position Set ( 영점 설정 완료 ) ===");
+  Serial.println("\r\n=== Zero Position Set ===");
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     mst_zero_pos_can1[i] = master_pos_can1[i];
     slv_zero_pos_can1[i] = slave_pos_can1[i];
@@ -354,12 +358,14 @@ void setZeroPosition() {
     float mst_zeroed = master_pos_can1[i] - mst_zero_pos_can1[i]; // 0.000 rad
     float slv_zeroed = slave_pos_can1[i] - slv_zero_pos_can1[i]; // 0.000 rad
 
-    Serial.printf("[CAN1 Zero] Master %d: %.3f rad (raw: %.3f) [Limit: -%.2f ~ +%.2f rad]\r\n",
+    Serial.printf("[CAN1 Zero] Master %d: %.3f rad (raw: %.3f) [Limit: %s (%.2f ~ %.2f rad)]\r\n",
                   MST_IDS_CAN1[i], mst_zeroed, master_pos_can1[i],
-                  MST_LIMIT_N_CAN1[i], MST_LIMIT_N_CAN1[i]);
-    Serial.printf("[CAN1 Zero] Slave %d: %.3f rad (raw: %.3f) [Limit: -%.2f ~ +%.2f rad]\r\n",
+                  USE_LIMIT_CAN1[i] ? "ON" : "OFF",
+                  LIMIT_MIN_CAN1[i], LIMIT_MAX_CAN1[i]);
+    Serial.printf("[CAN1 Zero] Slave %d: %.3f rad (raw: %.3f) [Limit: %s (%.2f ~ %.2f rad)]\r\n",
                   SLV_IDS_CAN1[i], slv_zeroed, slave_pos_can1[i],
-                  SLV_LIMIT_N_CAN1[i], SLV_LIMIT_N_CAN1[i]);
+                  USE_LIMIT_CAN1[i] ? "ON" : "OFF",
+                  LIMIT_MIN_CAN1[i], LIMIT_MAX_CAN1[i]);
   }
 
   for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
@@ -369,12 +375,14 @@ void setZeroPosition() {
     float mst_zeroed = master_pos_can2[i] - mst_zero_pos_can2[i];
     float slv_zeroed = slave_pos_can2[i] - slv_zero_pos_can2[i];
 
-    Serial.printf("[CAN2 Zero] Master %d: %.3f rad (raw: %.3f) [Limit: -%.2f ~ +%.2f rad]\r\n",
+    Serial.printf("[CAN2 Zero] Master %d: %.3f rad (raw: %.3f) [Limit: %s (%.2f ~ %.2f rad)]\r\n",
                   MST_IDS_CAN2[i], mst_zeroed, master_pos_can2[i],
-                  MST_LIMIT_N_CAN2[i], MST_LIMIT_N_CAN2[i]);
-    Serial.printf("[CAN2 Zero] Slave %d: %.3f rad (raw: %.3f) [Limit: -%.2f ~ +%.2f rad]\r\n",
+                  USE_LIMIT_CAN2[i] ? "ON" : "OFF",
+                  LIMIT_MIN_CAN2[i], LIMIT_MAX_CAN2[i]);
+    Serial.printf("[CAN2 Zero] Slave %d: %.3f rad (raw: %.3f) [Limit: %s (%.2f ~ %.2f rad)]\r\n",
                   SLV_IDS_CAN2[i], slv_zeroed, slave_pos_can2[i],
-                  SLV_LIMIT_N_CAN2[i], SLV_LIMIT_N_CAN2[i]);
+                  USE_LIMIT_CAN2[i] ? "ON" : "OFF",
+                  LIMIT_MIN_CAN2[i], LIMIT_MAX_CAN2[i]);
   }
 
   system_zeroed = true;
@@ -567,7 +575,7 @@ void loop() {
   }
 
   static uint32_t lastLedToggle = 0;
-  if (millis() - lastLedToggle >= 1000) {
+  if (millis() - lastLedToggle >= LOG_PERIOD) {
     lastLedToggle = millis();
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
@@ -589,16 +597,21 @@ void loop() {
         float master_target_raw = slave_pos_can1[i] - pos_offset_can1[i];
         float slave_target_raw  = master_pos_can1[i] + pos_offset_can1[i];
 
-        // 2. 영점 대비 -n ~ +n 범위 한계 클램핑
-        float mst_min = mst_zero_pos_can1[i] - MST_LIMIT_N_CAN1[i];
-        float mst_max = mst_zero_pos_can1[i] + MST_LIMIT_N_CAN1[i];
-        if (master_target_raw < mst_min) master_target_raw = mst_min;
-        if (master_target_raw > mst_max) master_target_raw = mst_max;
+        // 2. 해당 모터 쌍의 제한 로직이 켜진 경우(true)에만 공통 LIMIT_MIN ~ LIMIT_MAX 범위 클램핑
+        if (USE_LIMIT_CAN1[i]) {
+          float min_limit = LIMIT_MIN_CAN1[i];
+          float max_limit = LIMIT_MAX_CAN1[i];
 
-        float slv_min = slv_zero_pos_can1[i] - SLV_LIMIT_N_CAN1[i];
-        float slv_max = slv_zero_pos_can1[i] + SLV_LIMIT_N_CAN1[i];
-        if (slave_target_raw < slv_min) slave_target_raw = slv_min;
-        if (slave_target_raw > slv_max) slave_target_raw = slv_max;
+          float mst_min = mst_zero_pos_can1[i] + min_limit;
+          float mst_max = mst_zero_pos_can1[i] + max_limit;
+          if (master_target_raw < mst_min) master_target_raw = mst_min;
+          if (master_target_raw > mst_max) master_target_raw = mst_max;
+
+          float slv_min = slv_zero_pos_can1[i] + min_limit;
+          float slv_max = slv_zero_pos_can1[i] + max_limit;
+          if (slave_target_raw < slv_min) slave_target_raw = slv_min;
+          if (slave_target_raw > slv_max) slave_target_raw = slv_max;
+        }
 
         operationControlCan1(MST_IDS_CAN1[i], 0.0f, master_target_raw, 0.0f, master_kp, master_kd);
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_raw, 0.0f, slave_kp, slave_kd);
@@ -614,15 +627,20 @@ void loop() {
         float master_target_raw = slave_pos_can2[i] - pos_offset_can2[i];
         float slave_target_raw  = master_pos_can2[i] + pos_offset_can2[i];
 
-        float mst_min = mst_zero_pos_can2[i] - MST_LIMIT_N_CAN2[i];
-        float mst_max = mst_zero_pos_can2[i] + MST_LIMIT_N_CAN2[i];
-        if (master_target_raw < mst_min) master_target_raw = mst_min;
-        if (master_target_raw > mst_max) master_target_raw = mst_max;
+        if (USE_LIMIT_CAN2[i]) {
+          float min_limit = LIMIT_MIN_CAN2[i];
+          float max_limit = LIMIT_MAX_CAN2[i];
 
-        float slv_min = slv_zero_pos_can2[i] - SLV_LIMIT_N_CAN2[i];
-        float slv_max = slv_zero_pos_can2[i] + SLV_LIMIT_N_CAN2[i];
-        if (slave_target_raw < slv_min) slave_target_raw = slv_min;
-        if (slave_target_raw > slv_max) slave_target_raw = slv_max;
+          float mst_min = mst_zero_pos_can2[i] + min_limit;
+          float mst_max = mst_zero_pos_can2[i] + max_limit;
+          if (master_target_raw < mst_min) master_target_raw = mst_min;
+          if (master_target_raw > mst_max) master_target_raw = mst_max;
+
+          float slv_min = slv_zero_pos_can2[i] + min_limit;
+          float slv_max = slv_zero_pos_can2[i] + max_limit;
+          if (slave_target_raw < slv_min) slave_target_raw = slv_min;
+          if (slave_target_raw > slv_max) slave_target_raw = slv_max;
+        }
 
         operationControlCan2(MST_IDS_CAN2[i], 0.0f, master_target_raw, 0.0f, master_kp, master_kd);
         operationControlCan2(SLV_IDS_CAN2[i], 0.0f, slave_target_raw, 0.0f, slave_kp, slave_kd);
@@ -632,8 +650,9 @@ void loop() {
       }
     }
 
+    // 500ms마다 상태 모니터링 출력
     static uint32_t lastPrint = 0;
-    if (millis() - lastPrint >= LOG_PERIOD) {
+    if (millis() - lastPrint >= 500) {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
