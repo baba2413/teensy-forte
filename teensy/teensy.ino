@@ -55,7 +55,7 @@ const float RAW_LIMIT_MAX = 12.4f;
 // -------------------------------------------------------------
 // 3. 제어 주기 설정 (텔레오퍼레이션용 500 Hz / dt = 0.002초)
 // -------------------------------------------------------------
-const uint32_t CONTROL_PERIOD_US = 2000;
+const uint32_t CONTROL_PERIOD_US = 3333;
 elapsedMicros controlTimer;
 
 const uint32_t LOG_PERIOD = 1000;
