@@ -23,9 +23,9 @@ const float LIMIT_MIN_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {-1.5f, -2.0f}; // 
 const float LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.5f,  2.0f}; // 페어별 최대 이동 범위 (영점 기준 양수 rad)
 
 // --- CAN2 모터 Pair별 이동 범위 및 제한 사용여부 설정 ---
-const bool USE_LIMIT_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {false, true};
+const bool USE_LIMIT_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {false, false};
 const float LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-6.0f, -6.0f};
-const float LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 6.0f,  1.5f};
+const float LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 6.0f,  2.2f};
 
 // 슬레이브 모터 위치 추종 게인
 const float SLV_KP = 24.0f;
@@ -36,6 +36,11 @@ const float MAX_SAFE_TORQUE = 2.0f;       // 작업자 손목 보호용 최대 �
 const float K_WALL = 15.0f;               // 슬레이브 한계 가상벽 반발 강도 (Nm/rad)
 const float MASTER_KD = 0.0f;             // 마스터 모터 능동 댐핑
 const uint32_t WATCHDOG_TIMEOUT_MS = 100; // 통신 끊김 판정 기준 (100ms)
+
+// 슬레이브 충돌 토크 -> 마스터 피드백 변환 파라미터 (민감도 튜닝용)
+const float SLAVE_TRQ_DEADZONE = 0.08f;   // 이 값 미만의 슬레이브 토크는 노이즈로 간주해 무시 (Nm)
+const float SLAVE_TRQ_GAIN = 0.8f;        // 슬레이브 토크 대비 마스터 피드백 반영 비율
+const float MASTER_TRQ_MAX_STEP = 2.0f;   // 2ms 주기당 최대 토크 변화량 (Nm) - 클수록 반응이 즉각적
 
 // Teensy 4.0/4.1 CAN1, CAN2 사용
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
@@ -134,23 +139,22 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
 // 슬레이브 충돌 토크 안전 정화 함수 (Deadzone + Slew Rate Limiter)
 float processSlaveTorqueSafety(float slave_trq, MasterTorqueState &state) {
   float filtered_trq = slave_trq;
-  if (fabsf(filtered_trq) < 0.15f) {
+  if (fabsf(filtered_trq) < SLAVE_TRQ_DEADZONE) {
     filtered_trq = 0.0f;
   } else if (filtered_trq > 0) {
-    filtered_trq -= 0.15f;
+    filtered_trq -= SLAVE_TRQ_DEADZONE;
   } else {
-    filtered_trq += 0.15f;
+    filtered_trq += SLAVE_TRQ_DEADZONE;
   }
 
-  float target_trq = -1.0f * filtered_trq * 0.4f;
+  float target_trq = -1.0f * filtered_trq * SLAVE_TRQ_GAIN;
 
-  const float MAX_TORQUE_STEP = 0.10f; // 2ms당 최대 변화량
   float trq_delta = target_trq - state.current_output_trq;
 
-  if (trq_delta > MAX_TORQUE_STEP) {
-    target_trq = state.current_output_trq + MAX_TORQUE_STEP;
-  } else if (trq_delta < -MAX_TORQUE_STEP) {
-    target_trq = state.current_output_trq - MAX_TORQUE_STEP;
+  if (trq_delta > MASTER_TRQ_MAX_STEP) {
+    target_trq = state.current_output_trq + MASTER_TRQ_MAX_STEP;
+  } else if (trq_delta < -MASTER_TRQ_MAX_STEP) {
+    target_trq = state.current_output_trq - MASTER_TRQ_MAX_STEP;
   }
 
   state.current_output_trq = target_trq;
