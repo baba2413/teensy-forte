@@ -6,12 +6,12 @@
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
 const uint8_t NUM_MOTORS_CAN1 = 2;
-const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 2};
+const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {127, 2};
 const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {11, 12};
 
 const uint8_t NUM_MOTORS_CAN2 = 2;
 const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {3, 4};
-const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {13, 14};
+const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {13, 1};
 
 const uint8_t HOST_ID = 253;
 
@@ -25,7 +25,7 @@ const float LIMIT_MAX_CAN1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = { 2.5f,  2.0f}; // 
 // --- CAN2 모터 Pair별 이동 범위 및 제한 사용여부 설정 ---
 const bool USE_LIMIT_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {false, true};
 const float LIMIT_MIN_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {-6.0f, -6.0f};
-const float LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 6.0f,  2.2f};
+const float LIMIT_MAX_CAN2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = { 6.0f,  1.5f};
 
 // 슬레이브 모터 위치 추종 게인
 const float SLV_KP = 24.0f;
@@ -33,6 +33,7 @@ const float SLV_KD = 0.2f;
 
 // 마스터 모터 햅틱 피드백 토크 파라미터 (position-torque 방식)
 const float MAX_SAFE_TORQUE = 2.0f;       // 작업자 손목 보호용 최대 피드백 토크 (Nm)
+const float K_WALL = 15.0f;               // 슬레이브 한계 가상벽 반발 강도 (Nm/rad)
 const float MASTER_KD = 0.0f;             // 마스터 모터 능동 댐핑
 const uint32_t WATCHDOG_TIMEOUT_MS = 100; // 통신 끊김 판정 기준 (100ms)
 
@@ -524,6 +525,19 @@ void setupOffset() {
       continue;
     }
 
+    // 슬레이브가 이미 가상벽 한계 밖에 있는 상태로 Enable 시 급 스냅 방지
+    if (USE_LIMIT_CAN1[i]) {
+      float slv_min = slv_zero_pos_can1[i] + LIMIT_MIN_CAN1[i];
+      float slv_max = slv_zero_pos_can1[i] + LIMIT_MAX_CAN1[i];
+
+      if (slave_pos_can1[i] < slv_min || slave_pos_can1[i] > slv_max) {
+        Serial.printf("[SETUP CAN1] Pair %d Offset FAILED: slave %d already outside limit "
+                      "(pos: %.3f rad, limit: %.2f~%.2f rad) - reposition before enabling\r\n",
+                      i + 1, slave_id, slave_pos_can1[i], slv_min, slv_max);
+        continue;
+      }
+    }
+
     pos_offset_can1[i] = slave_pos_can1[i] - master_pos_can1[i];
     offset_ready_can1[i] = true;
 
@@ -563,6 +577,19 @@ void setupOffset() {
       Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: invalid position value\r\n",
                     pair_num);
       continue;
+    }
+
+    // 슬레이브가 이미 가상벽 한계 밖에 있는 상태로 Enable 시 급 스냅 방지
+    if (USE_LIMIT_CAN2[i]) {
+      float slv_min = slv_zero_pos_can2[i] + LIMIT_MIN_CAN2[i];
+      float slv_max = slv_zero_pos_can2[i] + LIMIT_MAX_CAN2[i];
+
+      if (slave_pos_can2[i] < slv_min || slave_pos_can2[i] > slv_max) {
+        Serial.printf("[SETUP CAN2] Pair %d Offset FAILED: slave %d already outside limit "
+                      "(pos: %.3f rad, limit: %.2f~%.2f rad) - reposition before enabling\r\n",
+                      pair_num, slave_id, slave_pos_can2[i], slv_min, slv_max);
+        continue;
+      }
     }
 
     pos_offset_can2[i] = slave_pos_can2[i] - master_pos_can2[i];
@@ -669,6 +696,7 @@ void loop() {
       if (system_enabled && offset_ready_can1[i] && watchdog_ok) {
         // 1. 슬레이브 목표 라디안 계산 (마스터를 추종, Raw 위치 기준)
         float slave_target_raw = master_pos_can1[i] + pos_offset_can1[i];
+        float limit_penetration = 0.0f;
 
         // 2. 해당 모터 쌍의 제한 로직이 켜진 경우(true)에만 LIMIT_MIN ~ LIMIT_MAX 범위 클램핑
         if (USE_LIMIT_CAN1[i]) {
@@ -677,14 +705,48 @@ void loop() {
 
           float slv_min = slv_zero_pos_can1[i] + min_limit;
           float slv_max = slv_zero_pos_can1[i] + max_limit;
+
+          if (slave_target_raw < slv_min || slave_target_raw > slv_max) {
+            limit_penetration = (slave_target_raw > slv_max) ? (slave_target_raw - slv_max) : (slave_target_raw - slv_min);
+
+            static uint32_t lastLimitWarnMs[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {0};
+            if (millis() - lastLimitWarnMs[i] > 200) {
+              lastLimitWarnMs[i] = millis();
+              Serial.printf("[CAN1 LIMIT] Pair %d Slave %d blocked by limit: target %.3f rad clamped to %.3f rad (%.2f~%.2f)\r\n",
+                            i + 1, SLV_IDS_CAN1[i], slave_target_raw,
+                            slave_target_raw < slv_min ? slv_min : slv_max,
+                            slv_min, slv_max);
+            }
+          }
+
           if (slave_target_raw < slv_min) slave_target_raw = slv_min;
           if (slave_target_raw > slv_max) slave_target_raw = slv_max;
         }
 
+        // 2b. 페어별 제한 설정과 무관하게 항상 적용되는 하드웨어 프로토콜 한계 백스톱
+        if (slave_target_raw < RAW_LIMIT_MIN || slave_target_raw > RAW_LIMIT_MAX) {
+          limit_penetration += (slave_target_raw > RAW_LIMIT_MAX) ? (slave_target_raw - RAW_LIMIT_MAX) : (slave_target_raw - RAW_LIMIT_MIN);
+
+          static uint32_t lastRawLimitWarnMs[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {0};
+          if (millis() - lastRawLimitWarnMs[i] > 200) {
+            lastRawLimitWarnMs[i] = millis();
+            Serial.printf("[CAN1 RAW LIMIT] Pair %d Slave %d blocked by hardware limit: target %.3f rad clamped to %.3f rad (%.1f~%.1f)\r\n",
+                          i + 1, SLV_IDS_CAN1[i], slave_target_raw,
+                          slave_target_raw < RAW_LIMIT_MIN ? RAW_LIMIT_MIN : RAW_LIMIT_MAX,
+                          RAW_LIMIT_MIN, RAW_LIMIT_MAX);
+          }
+
+          if (slave_target_raw < RAW_LIMIT_MIN) slave_target_raw = RAW_LIMIT_MIN;
+          if (slave_target_raw > RAW_LIMIT_MAX) slave_target_raw = RAW_LIMIT_MAX;
+        }
+
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_raw, 0.0f, slave_kp, slave_kd);
 
-        // 3. 마스터 피드백 토크 연산 (슬레이브 토크 기반 햅틱 피드백)
+        // 3. 마스터 피드백 토크 연산 (슬레이브 토크 기반 햅틱 피드백 + 한계 가상벽 반력)
         float master_trq = processSlaveTorqueSafety(slave_trq_can1[i], mst_trq_state_can1[i]);
+        if (limit_penetration != 0.0f) {
+          master_trq -= K_WALL * limit_penetration;
+        }
         if (master_trq > MAX_SAFE_TORQUE)  master_trq = MAX_SAFE_TORQUE;
         if (master_trq < -MAX_SAFE_TORQUE) master_trq = -MAX_SAFE_TORQUE;
 
@@ -702,6 +764,7 @@ void loop() {
 
       if (system_enabled && offset_ready_can2[i] && watchdog_ok) {
         float slave_target_raw = master_pos_can2[i] + pos_offset_can2[i];
+        float limit_penetration = 0.0f;
 
         if (USE_LIMIT_CAN2[i]) {
           float min_limit = LIMIT_MIN_CAN2[i];
@@ -709,13 +772,47 @@ void loop() {
 
           float slv_min = slv_zero_pos_can2[i] + min_limit;
           float slv_max = slv_zero_pos_can2[i] + max_limit;
+
+          if (slave_target_raw < slv_min || slave_target_raw > slv_max) {
+            limit_penetration = (slave_target_raw > slv_max) ? (slave_target_raw - slv_max) : (slave_target_raw - slv_min);
+
+            static uint32_t lastLimitWarnMs[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {0};
+            if (millis() - lastLimitWarnMs[i] > 200) {
+              lastLimitWarnMs[i] = millis();
+              Serial.printf("[CAN2 LIMIT] Pair %d Slave %d blocked by limit: target %.3f rad clamped to %.3f rad (%.2f~%.2f)\r\n",
+                            i + 1 + NUM_MOTORS_CAN1, SLV_IDS_CAN2[i], slave_target_raw,
+                            slave_target_raw < slv_min ? slv_min : slv_max,
+                            slv_min, slv_max);
+            }
+          }
+
           if (slave_target_raw < slv_min) slave_target_raw = slv_min;
           if (slave_target_raw > slv_max) slave_target_raw = slv_max;
+        }
+
+        // 2b. 페어별 제한 설정과 무관하게 항상 적용되는 하드웨어 프로토콜 한계 백스톱
+        if (slave_target_raw < RAW_LIMIT_MIN || slave_target_raw > RAW_LIMIT_MAX) {
+          limit_penetration += (slave_target_raw > RAW_LIMIT_MAX) ? (slave_target_raw - RAW_LIMIT_MAX) : (slave_target_raw - RAW_LIMIT_MIN);
+
+          static uint32_t lastRawLimitWarnMs[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {0};
+          if (millis() - lastRawLimitWarnMs[i] > 200) {
+            lastRawLimitWarnMs[i] = millis();
+            Serial.printf("[CAN2 RAW LIMIT] Pair %d Slave %d blocked by hardware limit: target %.3f rad clamped to %.3f rad (%.1f~%.1f)\r\n",
+                          i + 1 + NUM_MOTORS_CAN1, SLV_IDS_CAN2[i], slave_target_raw,
+                          slave_target_raw < RAW_LIMIT_MIN ? RAW_LIMIT_MIN : RAW_LIMIT_MAX,
+                          RAW_LIMIT_MIN, RAW_LIMIT_MAX);
+          }
+
+          if (slave_target_raw < RAW_LIMIT_MIN) slave_target_raw = RAW_LIMIT_MIN;
+          if (slave_target_raw > RAW_LIMIT_MAX) slave_target_raw = RAW_LIMIT_MAX;
         }
 
         operationControlCan2(SLV_IDS_CAN2[i], 0.0f, slave_target_raw, 0.0f, slave_kp, slave_kd);
 
         float master_trq = processSlaveTorqueSafety(slave_trq_can2[i], mst_trq_state_can2[i]);
+        if (limit_penetration != 0.0f) {
+          master_trq -= K_WALL * limit_penetration;
+        }
         if (master_trq > MAX_SAFE_TORQUE)  master_trq = MAX_SAFE_TORQUE;
         if (master_trq < -MAX_SAFE_TORQUE) master_trq = -MAX_SAFE_TORQUE;
 
