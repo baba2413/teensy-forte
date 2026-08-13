@@ -6,12 +6,12 @@
 // 1. 모터 및 통신 설정 파라미터
 // -------------------------------------------------------------
 const uint8_t NUM_MOTORS_CAN1 = 2;
-const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {127, 2};
+const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 2};
 const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {11, 12};
 
 const uint8_t NUM_MOTORS_CAN2 = 2;
 const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {3, 4};
-const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {13, 1};
+const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {13, 14};
 
 const uint8_t HOST_ID = 253;
 
@@ -63,7 +63,7 @@ const float RAW_LIMIT_MAX = 12.4f;
 const uint32_t CONTROL_PERIOD_US = 2000;
 elapsedMicros controlTimer;
 
-const uint32_t LOG_PERIOD = 2000;
+const uint32_t LOG_PERIOD = 1000;
 
 // -------------------------------------------------------------
 // 4. 실시간 상태, 오프셋, 영점 변수 및 제어 플래그
@@ -825,7 +825,7 @@ void loop() {
 
     // 500ms마다 상태 모니터링 출력
     static uint32_t lastPrint = 0;
-    if (millis() - lastPrint >= 500) {
+    if (millis() - lastPrint >= LOG_PERIOD) {
       lastPrint = millis();
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
