@@ -3,32 +3,32 @@
 #include <math.h>
 
 // -------------------------------------------------------------
-// 1. 모터 및 통신 설정 파라미터
+// 1. Motor and Communication Configuration Parameters
 // -------------------------------------------------------------
 const uint8_t NUM_MOTORS_CAN1 = 2;
 const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 3};
 const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {11, 13};
 
 const uint8_t NUM_MOTORS_CAN2 = 2;
-const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {2,4};
-const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {12,14};
+const uint8_t MST_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {2, 4};
+const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2 > 0 ? NUM_MOTORS_CAN2 : 1] = {12, 14};
 
 const uint8_t HOST_ID = 253;
 
 #define SAFE_BUF_SIZE(n) ((n) > 0 ? (n) : 1)
 
-// 마스터 모터 햅틱 피드백 게인 (양방향 제어용)
+// Master motor haptic feedback gains (for bilateral control)
 const float KP = 10.0f;
 const float KD = 0.1f;
 const float SLV_KP = 10.0f;
 const float SLV_KD = 0.1f;
 
-// Teensy 4.0/4.1 CAN1, CAN2 사용
+// Using Teensy 4.0/4.1 CAN1 and CAN2
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> Can2;
 
 // -------------------------------------------------------------
-// 2. Robstride 프로토콜 물리적 제한 한계값
+// 2. Robstride Protocol Physical Limit Constants
 // -------------------------------------------------------------
 const float P_MIN = -12.5f;
 const float P_MAX = 12.5f;
@@ -39,12 +39,12 @@ const float KD_MAX = 5.0f;
 const float T_MIN = -18.0f;
 const float T_MAX = 18.0f;
 
-// 단방향 모터 절대 하드웨어 소프트웨어 제한 (-12.4 ~ +12.4 rad)
+// Unidirectional motor absolute hardware/software limits (-12.4 ~ +12.4 rad)
 const float RAW_LIMIT_MIN = -12.4f;
 const float RAW_LIMIT_MAX = 12.4f;
 
 // -------------------------------------------------------------
-// 3. 제어 주기 설정 (텔레오퍼레이션용 500 Hz / dt = 0.002초)
+// 3. Control Loop Period Configuration (3333 us / ~300 Hz)
 // -------------------------------------------------------------
 const uint32_t CONTROL_PERIOD_US = 3333;
 elapsedMicros controlTimer;
@@ -52,9 +52,9 @@ elapsedMicros controlTimer;
 const uint32_t LOG_PERIOD = 2000;
 
 // -------------------------------------------------------------
-// 4. 실시간 상태, 오프셋 변수 및 제어 플래그
+// 4. Real-time Status, Offset Variables, and Control Flags
 // -------------------------------------------------------------
-bool system_enabled = false; // 'e' 버튼 제어 활성화 여부
+bool system_enabled = false; // Control enable flag (triggered via 'e' command)
 
 volatile float master_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile float slave_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
@@ -64,7 +64,7 @@ volatile float master_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 volatile float slave_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 float pos_offset_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]          = {};
 
-// 오프셋 계산 전 새 피드백 수신 여부 확인
+// Feedback reception validation flags before offset calculation
 volatile bool master_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile bool slave_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
 volatile bool master_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
@@ -73,7 +73,7 @@ volatile bool slave_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 bool offset_ready_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 bool offset_ready_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 
-// Type 2 피드백의 fault 및 mode 상태 저장
+// Storage for fault bits and motor mode from Type 2 feedback
 volatile uint8_t fault_bits_can1[256] = {0};
 volatile uint8_t fault_bits_can2[256] = {0};
 volatile uint8_t motor_mode_can1[256] = {0};
@@ -82,7 +82,7 @@ volatile bool fault_changed_can1[256] = {false};
 volatile bool fault_changed_can2[256] = {false};
 
 // -------------------------------------------------------------
-// 5. 데이터 스케일링 및 진단 헬퍼 함수
+// 5. Data Scaling and Diagnostic Helper Functions
 // -------------------------------------------------------------
 uint16_t floatToUint(float x, float x_min, float x_max, uint8_t bits) {
   if (x < x_min) x = x_min;
@@ -113,7 +113,7 @@ void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) 
 }
 
 // -------------------------------------------------------------
-// 6. Robstride CAN1 송신 제어 함수군
+// 6. Robstride CAN1 Transmission Functions
 // -------------------------------------------------------------
 void enableMotorCan1(uint8_t motor_id) {
   CAN_message_t mode_msg;
@@ -152,7 +152,7 @@ CAN_message_t operationControlCan1(uint8_t motor_id, float feed_forward, float p
                                    float vel, float kp, float kd) {
   CAN_message_t msg;
 
-  // Raw Radian이 -12.4 ~ 12.4 rad 한계를 벗어나는 패킷은 버림
+  // Drop packet if target angle exceeds the raw limit range (-12.4 ~ 12.4 rad)
   if (pos < RAW_LIMIT_MIN || pos > RAW_LIMIT_MAX) {
     static uint32_t lastWarnMs[256] = {0};
     if (millis() - lastWarnMs[motor_id] > 200) {
@@ -187,7 +187,7 @@ CAN_message_t operationControlCan1(uint8_t motor_id, float feed_forward, float p
 }
 
 // -------------------------------------------------------------
-// 7. Robstride CAN2 송신 제어 함수군
+// 7. Robstride CAN2 Transmission Functions
 // -------------------------------------------------------------
 void enableMotorCan2(uint8_t motor_id) {
   CAN_message_t mode_msg;
@@ -226,7 +226,7 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
                                    float vel, float kp, float kd) {
   CAN_message_t msg;
 
-  // Raw Radian이 -12.4 ~ 12.4 rad 한계를 벗어나는 패킷은 버림
+  // Drop packet if target angle exceeds the raw limit range (-12.4 ~ 12.4 rad)
   if (pos < RAW_LIMIT_MIN || pos > RAW_LIMIT_MAX) {
     static uint32_t lastWarnMs[256] = {0};
     if (millis() - lastWarnMs[motor_id] > 200) {
@@ -261,7 +261,7 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
 }
 
 // -------------------------------------------------------------
-// 8. CAN 수신 인터럽트 콜백
+// 8. CAN Receive Interrupt Callbacks
 // -------------------------------------------------------------
 void rxCallbackCan1(const CAN_message_t &msg) {
   uint8_t mode = (msg.id >> 24) & 0x1F;
@@ -326,7 +326,7 @@ void rxCallbackCan2(const CAN_message_t &msg) {
 }
 
 // -------------------------------------------------------------
-// 9. 초기 위치 오프셋 측정 헬퍼 함수
+// 9. Initial Position Offset Measurement Helper Function
 // -------------------------------------------------------------
 void setupOffset() {
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
@@ -341,7 +341,7 @@ void setupOffset() {
     offset_ready_can2[i] = false;
   }
 
-  // 모터 피드백 유도를 위한 Dummy 명령 전송
+  // Send dummy commands to request motor feedback responses
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
     operationControlCan1(SLV_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -358,7 +358,7 @@ void setupOffset() {
     Can2.events();
   }
 
-  // CAN1 오프셋 계산
+  // Calculate CAN1 offsets
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     uint8_t master_id = MST_IDS_CAN1[i];
     uint8_t slave_id = SLV_IDS_CAN1[i];
@@ -398,7 +398,7 @@ void setupOffset() {
                   motor_mode_can1[master_id], motor_mode_can1[slave_id]);
   }
 
-  // CAN2 오프셋 계산
+  // Calculate CAN2 offsets
   for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
     uint8_t master_id = MST_IDS_CAN2[i];
     uint8_t slave_id = SLV_IDS_CAN2[i];
@@ -441,7 +441,7 @@ void setupOffset() {
 }
 
 // -------------------------------------------------------------
-// 10. 메인 루프 구조
+// 10. Main Loop Structure
 // -------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -516,20 +516,20 @@ void loop() {
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 
-  // 2ms 주기 제어 루프 (500Hz)
+  // Periodic control loop execution
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
-    // 양방향 제어 게인 설정
-    float master_kp = KP; // 전역 변수 (3.0f)
-    float master_kd = KD; // 전역 변수 (0.0f)
+    // Bilateral control gain configuration
+    float master_kp = KP; // Global parameter
+    float master_kd = KD; // Global parameter
     float slave_kp  = SLV_KP;
     float slave_kd  = SLV_KD;
 
-    // --- CAN1 양방향 제어 ---
+    // --- CAN1 Bilateral Control ---
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
       if (system_enabled && offset_ready_can1[i]) {
-        // 추적 목표 라디안 계산 (Raw 위치 기준)
+        // Calculate tracking target angle (based on raw position)
         float master_target_raw = slave_pos_can1[i] - pos_offset_can1[i];
         float slave_target_raw  = master_pos_can1[i] + pos_offset_can1[i];
 
@@ -544,7 +544,7 @@ void loop() {
       }
     }
 
-    // --- CAN2 양방향 제어 ---
+    // --- CAN2 Bilateral Control ---
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
       if (system_enabled && offset_ready_can2[i]) {
         float master_target_raw = slave_pos_can2[i] - pos_offset_can2[i];
@@ -558,7 +558,7 @@ void loop() {
       }
     }
 
-    // 1000ms마다 상태 모니터링 출력
+    // Status monitoring printout every 1000 ms
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint >= 1000) {
       lastPrint = millis();
@@ -585,7 +585,7 @@ void loop() {
 }
 
 // -------------------------------------------------------------
-// 11. 시리얼 명령 수신 인터럽트
+// 11. Serial Command Reception Handler
 // -------------------------------------------------------------
 void serialEvent() {
   if (Serial.available()) {
