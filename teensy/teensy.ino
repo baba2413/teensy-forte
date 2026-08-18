@@ -56,7 +56,7 @@ const float SIM_DEFAULT_LINK_POS[NUM_JOINTS] = {0.0f, -1.0472f, 0.0f, 2.0944f};
 //     지금은 "작동만 확인"하는 단계이므로 최대한 좁게 잡는다.
 //     UDP로 어떤 값이 들어와도 이 범위를 벗어나면 클램프된다.
 // -------------------------------------------------------------
-const float TEST_LINK_RANGE_LIMIT = 1.0f; // rad (약 8.6deg)
+const float TEST_LINK_RANGE_LIMIT = 0.5f; // rad (약 8.6deg)
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
 
@@ -138,6 +138,10 @@ uint32_t LOG_PERIOD_MS = 1000;
 uint32_t lastLogMs = 0;
 bool serialLogPaused = false; // 'p' 명령으로 토글 (시리얼 도배 방지용 일시정지)
 
+// 'g' 명령으로 토글. 켜면 매 제어 루프(50Hz)마다 plot_positions.py가 파싱할 수 있는
+// 한 줄짜리 CSV(PLOT,...)를 출력한다. logStatus()의 사람이 읽기용 요약과는 별개.
+bool plotStreamEnabled = false;
+
 float last_cmd_link_pos[NUM_JOINTS] = {0.0f};
 float last_cmd_motor_pos[NUM_JOINTS] = {0.0f};
 float last_cmd_ff_torque[NUM_JOINTS] = {0.0f};
@@ -150,6 +154,10 @@ uint32_t raw_drop_count[NUM_JOINTS] = {0};
 // 마지막으로 수신한 원본 UDP 패킷 (strtok()이 원본 버퍼를 파괴하므로 로깅용으로 별도 보관)
 char last_udp_raw[64] = "";
 uint32_t last_udp_recv_ms = 0;
+
+// 안전 클램프(TEST_LINK_RANGE_LIMIT) 적용 "이전"의 UDP 원본 요청값. 클램프 후 값(ext_target_pos)과
+// 나란히 로깅해 "UDP가 실제로 뭘 요청했는지" vs "클램프 후 뭘 썼는지"를 구분할 수 있게 한다.
+float last_udp_target_raw[NUM_JOINTS] = {0.0f};
 
 // 마지막으로 모터에 실제 전송한 CAN 명령 프레임 (operationControl()에서 채움)
 uint32_t last_can_id[NUM_JOINTS] = {0};
@@ -449,40 +457,89 @@ void computeGravityTorques(float q_yaw, float q_pitch, float q_roll, float q_elb
   tau_link_out[3] = clampTorque(tau_elbow, GRAVITY_FF_LIMIT_ELBOW_NM);
 }
 
-// LOG_PERIOD_MS마다 호출: 조인트별 명령값(링크/모터축, 중력보상 토크), 실시간 raw 피드백,
-// 그리고 그 사이 발생한 클램프/드롭 횟수 요약을 출력한다.
-void logStatus() {
-  Serial.println("--- [STATUS] ---");
+const char* runModeStr(uint8_t mode) {
+  switch (mode) {
+    case 0: return "RESET (idle)";
+    case 1: return "CALIBRATING";
+    case 2: return "RUNNING";
+    default: return "UNKNOWN";
+  }
+}
 
-  uint32_t udp_age_ms = last_udp_recv_ms == 0 ? 0 : (millis() - last_udp_recv_ms);
+// fault_bits를 사람이 읽을 수 있는 이름 목록으로 변환 (printFaultBits()와 동일한 비트 의미 사용)
+void faultBitsToStr(uint8_t bits, char* out, size_t outSize) {
+  if (bits == 0) { snprintf(out, outSize, "none"); return; }
+  out[0] = '\0';
+  const char* names[6] = {
+    "UNDERVOLTAGE", "THREE_PHASE_OVERCURRENT", "OVERTEMPERATURE",
+    "MAGNETIC_ENCODER_FAULT", "STALL_OVERLOAD", "UNCALIBRATED"
+  };
+  for (int b = 0; b < 6; b++) {
+    if (!(bits & (1 << b))) continue;
+    if (out[0] != '\0') strncat(out, "+", outSize - strlen(out) - 1);
+    strncat(out, names[b], outSize - strlen(out) - 1);
+  }
+}
+
+// LOG_PERIOD_MS마다 호출: 조인트별로 "UDP가 요청한 값 -> 클램프 -> 캘리브레이션 적용 ->
+// 기어비 적용 -> 실제 CAN 전송값 -> 모터 피드백"까지 전체 파이프라인을 사람이 읽기 쉬운
+// 형태로 한 단계씩 출력한다. 그 사이 발생한 클램프/드롭 횟수도 함께 요약한다.
+void logStatus() {
+  uint32_t now = millis();
+  Serial.println("=======================================================================");
+  Serial.printf("STATUS  t=%lums  control_active=%s\r\n",
+                (unsigned long)now, ext_control_active ? "YES" : "NO (watchdog timeout / not enabled)");
+
   if (last_udp_recv_ms == 0) {
-    Serial.println("  [UDP] no packet received yet");
+    Serial.println("UDP packet : none received yet");
   } else {
-    Serial.printf("  [UDP] last=\"%s\" age=%lums\r\n", last_udp_raw, (unsigned long)udp_age_ms);
+    Serial.printf("UDP packet : \"%s\"  (received %lums ago, watchdog timeout=%lums)\r\n",
+                  last_udp_raw, (unsigned long)(now - last_udp_recv_ms), (unsigned long)WATCHDOG_TIMEOUT_MS);
   }
 
   for (int i = 0; i < NUM_JOINTS; i++) {
-    Serial.printf("  Joint %d %-14s (CAN %2d) | cmd_link=%7.3f cmd_motor=%7.3f ff_trq=%6.3f | fb_raw=%7.3f fb_vel=%6.2f fb_trq=%6.2f | %s | mode=%d fault=0x%02X | clamped=%lu dropped=%lu\r\n",
-                  i, JOINT_NAMES[i], JOINT_CAN_IDS[i],
-                  last_cmd_link_pos[i], last_cmd_motor_pos[i], last_cmd_ff_torque[i],
-                  fb[i].pos, fb[i].vel, fb[i].torque,
-                  fb[i].updated ? "FB_OK" : "FB_NONE",
-                  fb[i].run_mode, fb[i].fault_bits,
-                  (unsigned long)range_clamp_count[i], (unsigned long)raw_drop_count[i]);
+    char faultStr[96];
+    faultBitsToStr(fb[i].fault_bits, faultStr, sizeof(faultStr));
+
+    Serial.printf("\r\n[%s] (CAN ID %d)  motor state=%s  fault=%s\r\n",
+                  JOINT_NAMES[i], JOINT_CAN_IDS[i], runModeStr(fb[i].run_mode), faultStr);
+
+    Serial.printf("  1. UDP requested position (link axis)    : %8.4f rad\r\n",
+                  last_udp_target_raw[i]);
+    Serial.printf("  2. After safety clamp (link axis)        : %8.4f rad  (clamped %lu time(s) this period, limit=sim_default+-%.2f)\r\n",
+                  ext_target_pos[i], (unsigned long)range_clamp_count[i], TEST_LINK_RANGE_LIMIT);
+    Serial.printf("  3. Calibration used                      : sign=%+.1f  offset=%+.4f rad\r\n",
+                  calib[i].sign, calib[i].offset);
+    Serial.printf("  4. After calibration (link axis)         : %8.4f rad\r\n",
+                  last_cmd_link_pos[i]);
+    Serial.printf("  5. After gear ratio, x%.4f (motor axis)  : %8.4f rad\r\n",
+                  GEAR_RATIO[i], last_cmd_motor_pos[i]);
 
     if (last_can_sent[i]) {
-      Serial.printf("      -> CAN TX id=0x%08lX buf=[%02X %02X %02X %02X %02X %02X %02X %02X] (pos|vel|kp|kd, 2B each)\r\n",
-                    (unsigned long)last_can_id[i],
-                    last_can_buf[i][0], last_can_buf[i][1], last_can_buf[i][2], last_can_buf[i][3],
-                    last_can_buf[i][4], last_can_buf[i][5], last_can_buf[i][6], last_can_buf[i][7]);
+      uint16_t p_raw = (last_can_buf[i][0] << 8) | last_can_buf[i][1];
+      float encoded_pos = uintToFloat(p_raw, P_MIN, P_MAX);
+      uint16_t t_raw = (last_can_id[i] >> 8) & 0xFFFF;
+      float encoded_ff = uintToFloat(t_raw, T_MIN, T_MAX);
+      Serial.printf("  6. Actually sent on CAN bus (motor axis) : %8.4f rad  [SENT]  (id=0x%08lX, feed-forward torque=%.3f Nm)\r\n",
+                    encoded_pos, (unsigned long)last_can_id[i], encoded_ff);
     } else {
-      Serial.println("      -> CAN TX: none (dropped by RAW_LIMIT or not yet sent)");
+      Serial.printf("  6. Actually sent on CAN bus              : DROPPED, not sent  (outside +-%.1f rad raw limit, %lu drop(s) this period)\r\n",
+                    RAW_LIMIT_MAX, (unsigned long)raw_drop_count[i]);
+    }
+
+    if (fb[i].updated) {
+      Serial.printf("  7. Motor feedback, measured (motor axis) : %8.4f rad\r\n", fb[i].pos);
+      Serial.printf("     Motor feedback, measured (link axis)  : %8.4f rad  (= feedback / gear ratio)\r\n",
+                    fb[i].pos / GEAR_RATIO[i]);
+      Serial.printf("     Motor feedback velocity / torque      : %6.2f rad/s  /  %6.2f Nm\r\n", fb[i].vel, fb[i].torque);
+    } else {
+      Serial.println("  7. Motor feedback                        : none received since last command sent");
     }
 
     range_clamp_count[i] = 0;
     raw_drop_count[i] = 0;
   }
-  Serial.printf("  ext_control_active=%d\r\n\r\n", ext_control_active);
+  Serial.println("=======================================================================\r\n");
 }
 
 // -------------------------------------------------------------
@@ -513,6 +570,7 @@ void setup() {
   Serial.println("                  e=pose arm to sim default pose by hand, THEN press e");
   Serial.println("                    -> enables motors + auto-computes calib[] offsets once");
   Serial.println("                  p=pause/resume periodic status log");
+  Serial.println("                  g=toggle real-time PLOT,... CSV stream (for plot_positions.py)");
   Serial.println("                  f=attempt fault reset on all motors (stop->re-enable->stop)");
   Serial.println("==================================================");
 
@@ -551,6 +609,7 @@ void loop() {
           token = strtok(NULL, ",");
           if (token != NULL) {
             float v = atof(token);
+            last_udp_target_raw[i] = v; // 클램프 적용 전 원본값 (로깅용)
 
             // 실기 최초 확인 단계 안전장치: SIM_DEFAULT_LINK_POS 기준 +-TEST_LINK_RANGE_LIMIT로 클램프
             // (Isaac Sim 쪽 실제 동작 폭이 이 범위보다 훨씬 커서 거의 매 패킷 클램프되는 게 정상.
@@ -606,6 +665,14 @@ void loop() {
         operationControl(JOINT_CAN_IDS[i], feed_forward_torque, motor_pos, target_vel, kp, kd);
       }
 
+      if (plotStreamEnabled) {
+        // PLOT,millis,link_yaw,link_pitch,link_roll,link_elbow,motor_yaw,motor_pitch,motor_roll,motor_elbow
+        Serial.printf("PLOT,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\r\n",
+                      (unsigned long)millis(),
+                      last_cmd_link_pos[0], last_cmd_link_pos[1], last_cmd_link_pos[2], last_cmd_link_pos[3],
+                      last_cmd_motor_pos[0], last_cmd_motor_pos[1], last_cmd_motor_pos[2], last_cmd_motor_pos[3]);
+      }
+
     } else {
       // 왓치독 타임아웃 처리
       if (ext_control_active) {
@@ -628,6 +695,7 @@ void loop() {
 // E: 로봇팔을 SIM_DEFAULT_LINK_POS 자세로 손으로 맞춘 뒤 누르면 전체 모터 enable + 오프셋 1회 자동 계산
 // D: 전체 끄기
 // P: 주기 상태 로그(logStatus) 출력 일시정지/재개 토글 (모터 제어/UDP 수신에는 영향 없음)
+// G: 실시간 위치 CSV(PLOT,...) 스트림 토글 (plot_positions.py가 이 출력을 파싱함)
 // F: 전체 모터 fault 초기화 시도 (정지->Run Mode 재기록->enable->정지, 이후 다시 e로 enable 필요)
 void serialEvent() {
   if (Serial.available()) {
@@ -645,6 +713,9 @@ void serialEvent() {
     } else if (ch == 'p' || ch == 'P') {
       serialLogPaused = !serialLogPaused;
       Serial.printf("[Teensy] Status log %s.\r\n", serialLogPaused ? "PAUSED" : "RESUMED");
+    } else if (ch == 'g' || ch == 'G') {
+      plotStreamEnabled = !plotStreamEnabled;
+      Serial.printf("[Teensy] Plot CSV stream %s.\r\n", plotStreamEnabled ? "ON" : "OFF");
     } else if (ch == 'f' || ch == 'F') {
       ext_control_active = false; // fault 초기화 후에는 재enable('e') 전까지 UDP 제어 재개하지 않음
       for (int i = 0; i < NUM_JOINTS; i++) {
