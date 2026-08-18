@@ -105,8 +105,30 @@ struct MotorFeedback {
   float vel;
   float torque;
   bool updated;
+  uint8_t fault_bits;   // Type2 피드백 ID의 bit16~21 (6bit), teleop-bi a483a4c와 동일 레이아웃
+  uint8_t run_mode;     // Type2 피드백 ID의 bit22~23 (2bit): 0 reset, 1 cali, 2 motor run
+  bool fault_changed;   // 직전 값과 달라졌을 때만 loop()에서 1회 로깅하기 위한 플래그
 };
 MotorFeedback fb[NUM_JOINTS];
+
+// Type2 피드백 CAN ID에 실린 fault 비트 의미 (teensy-forte teleop-bi a483a4c 기준, 검증됨)
+void printFaultBits(int idx, uint8_t fault_bits) {
+  Serial.printf("[FAULT] Joint %d %-14s (CAN %2d) | Raw: 0x%02X",
+                idx, JOINT_NAMES[idx], JOINT_CAN_IDS[idx], fault_bits);
+
+  if (fault_bits == 0) {
+    Serial.println(" | CLEARED");
+    return;
+  }
+
+  if (fault_bits & (1 << 0)) Serial.print(" | UNDERVOLTAGE");
+  if (fault_bits & (1 << 1)) Serial.print(" | THREE_PHASE_OVERCURRENT");
+  if (fault_bits & (1 << 2)) Serial.print(" | OVERTEMPERATURE");
+  if (fault_bits & (1 << 3)) Serial.print(" | MAGNETIC_ENCODER_FAULT");
+  if (fault_bits & (1 << 4)) Serial.print(" | STALL_OVERLOAD");
+  if (fault_bits & (1 << 5)) Serial.print(" | UNCALIBRATED");
+  Serial.println();
+}
 
 // -------------------------------------------------------------
 // 6c. 상태 로깅 (teensy-forte teleop-bi 스타일)
@@ -114,6 +136,7 @@ MotorFeedback fb[NUM_JOINTS];
 // -------------------------------------------------------------
 uint32_t LOG_PERIOD_MS = 1000;
 uint32_t lastLogMs = 0;
+bool serialLogPaused = false; // 'p' 명령으로 토글 (시리얼 도배 방지용 일시정지)
 
 float last_cmd_link_pos[NUM_JOINTS] = {0.0f};
 float last_cmd_motor_pos[NUM_JOINTS] = {0.0f};
@@ -162,6 +185,14 @@ void rxCallback(const CAN_message_t &msg) {
   int idx = getJointIndex(motor_id);
   if (idx < 0) return;
 
+  uint8_t new_fault_bits = (msg.id >> 16) & 0x3F;
+  uint8_t new_run_mode = (msg.id >> 22) & 0x03;
+  if (new_fault_bits != fb[idx].fault_bits) {
+    fb[idx].fault_bits = new_fault_bits;
+    fb[idx].fault_changed = true; // 실제 출력은 loop()에서 (콜백 안에서 Serial.printf 남발 방지)
+  }
+  fb[idx].run_mode = new_run_mode;
+
   uint16_t p_raw = (msg.buf[0] << 8) | msg.buf[1];
   uint16_t v_raw = (msg.buf[2] << 8) | msg.buf[3];
   uint16_t t_raw = (msg.buf[4] << 8) | msg.buf[5];
@@ -199,6 +230,18 @@ void disableMotor(uint8_t motor_id) {
   for (int i = 0; i < 8; i++) msg.buf[i] = 0;
   Can0.write(msg);
   Serial.printf("[Teensy] Motor ID %d Disabled.\r\n", motor_id);
+}
+
+// 과전류/과열/스톨 등으로 fault 상태에 빠져 위치 명령이 먹히지 않을 때 호출.
+// Type4 프레임에 fault-clear용 데이터 바이트가 있다는 설(buf[0]=1)은 이 레포의 어떤 브랜치
+// 기록에도 사용된 전례가 없어 검증되지 않은 추측이었다(펌웨어가 무시할 가능성이 높음).
+// 대신 'e'가 매번 수행하는, 실제로 검증된 재기동 시퀀스(정지 -> Run Mode 재기록 -> enable)를
+// 그대로 재사용한다: 컨트롤러가 Run Mode 재진입 시 fault를 재평가/해제하는 것이 표준 동작이며,
+// 위치 명령은 실리지 않으므로 팔이 갑자기 움직이지는 않는다.
+void clearFault(uint8_t motor_id) {
+  disableMotor(motor_id);
+  delay(20);
+  enableMotor(motor_id);
 }
 
 void operationControl(uint8_t motor_id, float feed_forward, float pos, float vel, float kp, float kd) {
@@ -335,15 +378,18 @@ const Vec3  COM_WRIST_LINK          = {0.0466f, 0.0281f, 0.0268f};
 
 const Vec3 GRAVITY_VEC = {0.0f, 0.0f, -GRAVITY};
 
+// 중력 보상 사용 여부 (필요시 false로 바꿔 feed-forward 토크를 끈다)
+bool GRAVITY_COMPENSATION_ENABLED = false;
+
 // 안전 캡: 첫 실기 검증 단계에서 계산이 틀리더라도 과도한 토크가 나가지 않도록 제한.
 // 관절 전체 가동범위(+-pi, URDF 리밋)를 전수 탐색해 구한 이론상 최댓값은
 // pitch 8.17Nm, roll 2.39Nm, elbow 2.39Nm (yaw는 항상 0이라 대상 아님).
 // pitch가 roll/elbow보다 3배 이상 커서 하나의 캡을 공유하면 pitch는 계속 잘리거나
 // roll/elbow의 마진이 과도하게 느슨해지므로, 관절별로 따로 잡는다
 // (최댓값 대비 10~15% 여유, T_MAX=18Nm 대비 충분히 낮은 수준).
-const float GRAVITY_FF_LIMIT_PITCH_NM = 5.0f; // Nm (링크축 기준)
-const float GRAVITY_FF_LIMIT_ROLL_NM  = 2.0f; // Nm (링크축 기준)
-const float GRAVITY_FF_LIMIT_ELBOW_NM = 2.0f; // Nm (링크축 기준)
+const float GRAVITY_FF_LIMIT_PITCH_NM = 3.0f; // Nm (링크축 기준)
+const float GRAVITY_FF_LIMIT_ROLL_NM  = 1.0f; // Nm (링크축 기준)
+const float GRAVITY_FF_LIMIT_ELBOW_NM = 1.0f; // Nm (링크축 기준)
 
 float clampTorque(float v, float limit) {
   if (v < -limit) return -limit;
@@ -416,11 +462,12 @@ void logStatus() {
   }
 
   for (int i = 0; i < NUM_JOINTS; i++) {
-    Serial.printf("  Joint %d %-14s (CAN %2d) | cmd_link=%7.3f cmd_motor=%7.3f ff_trq=%6.3f | fb_raw=%7.3f fb_vel=%6.2f fb_trq=%6.2f | %s | clamped=%lu dropped=%lu\r\n",
+    Serial.printf("  Joint %d %-14s (CAN %2d) | cmd_link=%7.3f cmd_motor=%7.3f ff_trq=%6.3f | fb_raw=%7.3f fb_vel=%6.2f fb_trq=%6.2f | %s | mode=%d fault=0x%02X | clamped=%lu dropped=%lu\r\n",
                   i, JOINT_NAMES[i], JOINT_CAN_IDS[i],
                   last_cmd_link_pos[i], last_cmd_motor_pos[i], last_cmd_ff_torque[i],
                   fb[i].pos, fb[i].vel, fb[i].torque,
                   fb[i].updated ? "FB_OK" : "FB_NONE",
+                  fb[i].run_mode, fb[i].fault_bits,
                   (unsigned long)range_clamp_count[i], (unsigned long)raw_drop_count[i]);
 
     if (last_can_sent[i]) {
@@ -465,6 +512,8 @@ void setup() {
   Serial.println("Serial commands : d=disable");
   Serial.println("                  e=pose arm to sim default pose by hand, THEN press e");
   Serial.println("                    -> enables motors + auto-computes calib[] offsets once");
+  Serial.println("                  p=pause/resume periodic status log");
+  Serial.println("                  f=attempt fault reset on all motors (stop->re-enable->stop)");
   Serial.println("==================================================");
 
   controlTimer = 0;
@@ -472,6 +521,14 @@ void setup() {
 
 void loop() {
   Can0.events();
+
+  // fault 상태 변화 시 즉시 출력 (LOG_PERIOD_MS 대기 없이, 값이 바뀔 때만 1회)
+  for (int i = 0; i < NUM_JOINTS; i++) {
+    if (fb[i].fault_changed) {
+      fb[i].fault_changed = false;
+      printFaultBits(i, fb[i].fault_bits);
+    }
+  }
 
   // UDP 수신 처리
   int packetSize = udp.parsePacket();
@@ -539,7 +596,7 @@ void loop() {
         // 3. 모터:링크 회전비를 곱해 모터축(=CAN 명령) 좌표계로 변환
         float motor_pos = link_pos[i] * GEAR_RATIO[i];
         // 토크는 위치와 반대로 회전비로 나눔 (외부 감속단이 토크를 ratio배 증폭하므로)
-        float feed_forward_torque = tau_gravity_link[i] / GEAR_RATIO[i];
+        float feed_forward_torque = GRAVITY_COMPENSATION_ENABLED ? (tau_gravity_link[i] / GEAR_RATIO[i]) : 0.0f;
 
         last_cmd_link_pos[i] = link_pos[i];
         last_cmd_motor_pos[i] = motor_pos;
@@ -560,7 +617,7 @@ void loop() {
       }
     }
 
-    if (millis() - lastLogMs >= LOG_PERIOD_MS) {
+    if (!serialLogPaused && millis() - lastLogMs >= LOG_PERIOD_MS) {
       lastLogMs = millis();
       logStatus();
     }
@@ -570,6 +627,8 @@ void loop() {
 // 시리얼 명령 수동 제어
 // E: 로봇팔을 SIM_DEFAULT_LINK_POS 자세로 손으로 맞춘 뒤 누르면 전체 모터 enable + 오프셋 1회 자동 계산
 // D: 전체 끄기
+// P: 주기 상태 로그(logStatus) 출력 일시정지/재개 토글 (모터 제어/UDP 수신에는 영향 없음)
+// F: 전체 모터 fault 초기화 시도 (정지->Run Mode 재기록->enable->정지, 이후 다시 e로 enable 필요)
 void serialEvent() {
   if (Serial.available()) {
     char ch = Serial.read();
@@ -583,6 +642,19 @@ void serialEvent() {
         delay(20); // CAN 버스 연속 명령 안정성을 위한 미세 딜레이
       }
       computeCalibOffsets();
+    } else if (ch == 'p' || ch == 'P') {
+      serialLogPaused = !serialLogPaused;
+      Serial.printf("[Teensy] Status log %s.\r\n", serialLogPaused ? "PAUSED" : "RESUMED");
+    } else if (ch == 'f' || ch == 'F') {
+      ext_control_active = false; // fault 초기화 후에는 재enable('e') 전까지 UDP 제어 재개하지 않음
+      for (int i = 0; i < NUM_JOINTS; i++) {
+        clearFault(JOINT_CAN_IDS[i]); // 정지 -> Run Mode 재기록 -> enable (재기동으로 fault 재평가 유도)
+        delay(20);
+        // enable 직후 위치 명령(Type1)을 아직 보내지 않은 상태에서 모터가 어떻게 반응하는지는
+        // 검증되지 않았으므로, 안전하게 다시 정지 상태로 확실히 되돌려놓는다.
+        disableMotor(JOINT_CAN_IDS[i]);
+        delay(20);
+      }
     }
   }
 }
