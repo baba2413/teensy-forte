@@ -111,6 +111,16 @@ struct MotorFeedback {
 };
 MotorFeedback fb[NUM_JOINTS];
 
+// CAN 수신 진단용 카운터/원본값. rxCallback()이 애초에 호출되고 있는지, mode==2 프레임이
+// 오고 있는지, motor_id 매칭이 실패하는지를 로그로 직접 확인하기 위함 (getpos.txt는 되는데
+// 이 코드는 안 되는 원인을 추측이 아니라 실측으로 좁히기 위해 추가).
+volatile uint32_t can_rx_total = 0;      // rxCallback 진입 총 횟수 (mode 무관)
+volatile uint32_t can_rx_mode2 = 0;      // mode==2 (피드백) 프레임 총 횟수
+volatile uint32_t can_rx_unmatched = 0;  // mode==2인데 motor_id가 JOINT_CAN_IDS와 매칭 안 된 횟수
+volatile uint32_t last_raw_can_id = 0;
+volatile uint8_t  last_raw_can_len = 0;
+volatile uint32_t last_raw_can_ms = 0;
+
 // Type2 피드백 CAN ID에 실린 fault 비트 의미 (teensy-forte teleop-bi a483a4c 기준, 검증됨)
 void printFaultBits(int idx, uint8_t fault_bits) {
   Serial.printf("[FAULT] Joint %d %-14s (CAN %2d) | Raw: 0x%02X",
@@ -132,9 +142,18 @@ void printFaultBits(int idx, uint8_t fault_bits) {
 
 // -------------------------------------------------------------
 // 6c. 상태 로깅 (teensy-forte teleop-bi 스타일)
-//     LOG_PERIOD_MS(기본 1초)마다 명령값(링크/모터축)과 실시간 피드백(raw)을 출력한다.
+//     LOG_PERIOD_MS마다 명령값(링크/모터축)과 실시간 피드백(raw)을 출력한다.
 // -------------------------------------------------------------
-uint32_t LOG_PERIOD_MS = 1000;
+const uint32_t NORMAL_LOG_PERIOD_MS = 1000;
+// enable_debug=true일 때 'e'로 enable하면 이 주기로 낮춰서 촘촘하게(제어 루프와 동일 주기,
+// 즉 매 tick) 로그를 남긴다. 로그가 빠르게 쌓이므로 'p'로 일시정지시켜 원하는 시점을 확인한다.
+const uint32_t DEBUG_LOG_PERIOD_MS = 700;
+
+// 디버그 모드 수동 스위치. true/false는 코드에서 직접 바꿔서 재업로드한다.
+// true면 'e' enable 시 LOG_PERIOD_MS가 DEBUG_LOG_PERIOD_MS로 낮아져 로그가 훨씬 자주 찍힌다.
+bool enable_debug = true;
+
+uint32_t LOG_PERIOD_MS = NORMAL_LOG_PERIOD_MS;
 uint32_t lastLogMs = 0;
 bool serialLogPaused = false; // 'p' 명령으로 토글 (시리얼 도배 방지용 일시정지)
 
@@ -186,12 +205,24 @@ int getJointIndex(uint8_t motor_id) {
 
 // CAN 피드백(Type 2) 수신 콜백: 모터 현재 위치/속도/토크 파싱
 void rxCallback(const CAN_message_t &msg) {
+  can_rx_total++;
+  last_raw_can_id = msg.id;
+  last_raw_can_len = msg.len;
+  last_raw_can_ms = millis();
+
   uint8_t mode = (msg.id >> 24) & 0x1F;
   if (mode != 2) return;
+  can_rx_mode2++;
 
   uint8_t motor_id = (msg.id >> 8) & 0xFF;
   int idx = getJointIndex(motor_id);
-  if (idx < 0) return;
+  if (idx < 0) {
+    // getpos.txt에서 검증된 fallback: 일부 피드백 프레임은 모터 ID가 bit8~15가 아니라
+    // 하위 바이트(bit0~7)에 실려 온다. 여기서도 없으면 진짜로 매칭 실패.
+    motor_id = msg.id & 0xFF;
+    idx = getJointIndex(motor_id);
+  }
+  if (idx < 0) { can_rx_unmatched++; return; }
 
   uint8_t new_fault_bits = (msg.id >> 16) & 0x3F;
   uint8_t new_run_mode = (msg.id >> 22) & 0x03;
@@ -287,26 +318,16 @@ void operationControl(uint8_t motor_id, float feed_forward, float pos, float vel
   }
 }
 
-// enable 직후 1회 호출: 현재(=사용자가 손으로 맞춰놓은) 자세를 raw로 읽어
-// SIM_DEFAULT_LINK_POS와 비교, calib[].offset을 계산해 즉시 반영한다.
+// 'c' 명령으로 호출 (enable('e')과 분리됨, enable 여부와 무관하게 언제든 실행 가능):
+// 로봇팔을 손으로 SIM_DEFAULT_LINK_POS 자세에 맞춘 뒤 누르면, loop()가 상시 갱신 중인
+// 현재 모터 피드백을 그대로 읽어 SIM_DEFAULT_LINK_POS와 비교, calib[].offset을 계산해
+// 즉시 반영한다. loop()가 idle 상태에서도 무저항 프로브로 fb[]를 계속 갱신해두므로
+// 여기서 별도로 프로브를 보내고 기다릴 필요가 없다.
 void computeCalibOffsets() {
-  for (int i = 0; i < NUM_JOINTS; i++) fb[i].updated = false;
-
-  // 무저항(zero-gain) 프로브 프레임: 모터를 움직이지 않고 피드백만 요청
-  for (int i = 0; i < NUM_JOINTS; i++) {
-    operationControl(JOINT_CAN_IDS[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-  }
-
-  // 피드백 수신 대기 (100ms 동안 CAN 이벤트 펌핑)
-  uint32_t waitStart = millis();
-  while (millis() - waitStart < 100) {
-    Can0.events();
-  }
-
   Serial.println("--- [CALIB] Offset snapshot (motor pos vs sim default pose) ---");
   for (int i = 0; i < NUM_JOINTS; i++) {
     if (!fb[i].updated) {
-      Serial.printf("  Joint %d %-14s (CAN %2d): FAILED - no feedback received\r\n",
+      Serial.printf("  Joint %d %-14s (CAN %2d): FAILED - no feedback received yet\r\n",
                     i, JOINT_NAMES[i], JOINT_CAN_IDS[i]);
       continue;
     }
@@ -481,9 +502,10 @@ void faultBitsToStr(uint8_t bits, char* out, size_t outSize) {
   }
 }
 
-// LOG_PERIOD_MS마다 호출: 조인트별로 "UDP가 요청한 값 -> 클램프 -> 캘리브레이션 적용 ->
-// 기어비 적용 -> 실제 CAN 전송값 -> 모터 피드백"까지 전체 파이프라인을 사람이 읽기 쉬운
-// 형태로 한 단계씩 출력한다. 그 사이 발생한 클램프/드롭 횟수도 함께 요약한다.
+// LOG_PERIOD_MS마다 호출: 조인트별로
+//   1. 현재 모터 포지션(실측) -> 2. UDP 패킷에 의한 목표 포지션 -> 3. 이 모터 오프셋 ->
+//   4. 기어비 -> 5. 오프셋+기어비 적용한 최종 포지션 -> 6. CAN에 포장된 최종 포지션(5와 비교)
+// 순서로 출력한다. 그 사이 발생한 클램프/드롭 횟수도 함께 요약한다.
 void logStatus() {
   uint32_t now = millis();
   Serial.println("=======================================================================");
@@ -497,6 +519,16 @@ void logStatus() {
                   last_udp_raw, (unsigned long)(now - last_udp_recv_ms), (unsigned long)WATCHDOG_TIMEOUT_MS);
   }
 
+  // CAN 수신 진단: rxCallback이 실제로 호출되고 있는지(any mode), 그 중 mode==2(피드백)가
+  // 몇 개인지, 그중 motor_id 매칭에 실패한 게 몇 개인지, 마지막으로 본 raw CAN ID/길이.
+  // 이 값들이 전부 0이면 인터럽트 자체가 안 도는 것(배선/버스 문제), can_rx_total>0인데
+  // can_rx_mode2=0이면 mode 필드 해석이 잘못된 것, can_rx_unmatched>0이면 motor_id 위치가
+  // 잘못된 것 - 원인을 추측이 아니라 이 숫자로 좁힐 수 있다.
+  Serial.printf("CAN RX diag : total=%lu  mode2(feedback)=%lu  unmatched_id=%lu  last_raw_id=0x%08lX len=%u (%lums ago)\r\n",
+                (unsigned long)can_rx_total, (unsigned long)can_rx_mode2, (unsigned long)can_rx_unmatched,
+                (unsigned long)last_raw_can_id, (unsigned)last_raw_can_len,
+                (unsigned long)(last_raw_can_ms == 0 ? 0 : now - last_raw_can_ms));
+
   for (int i = 0; i < NUM_JOINTS; i++) {
     char faultStr[96];
     faultBitsToStr(fb[i].fault_bits, faultStr, sizeof(faultStr));
@@ -504,36 +536,30 @@ void logStatus() {
     Serial.printf("\r\n[%s] (CAN ID %d)  motor state=%s  fault=%s\r\n",
                   JOINT_NAMES[i], JOINT_CAN_IDS[i], runModeStr(fb[i].run_mode), faultStr);
 
-    Serial.printf("  1. UDP requested position (link axis)    : %8.4f rad\r\n",
-                  last_udp_target_raw[i]);
-    Serial.printf("  2. After safety clamp (link axis)        : %8.4f rad  (clamped %lu time(s) this period, limit=sim_default+-%.2f)\r\n",
-                  ext_target_pos[i], (unsigned long)range_clamp_count[i], TEST_LINK_RANGE_LIMIT);
-    Serial.printf("  3. Calibration used                      : sign=%+.1f  offset=%+.4f rad\r\n",
-                  calib[i].sign, calib[i].offset);
-    Serial.printf("  4. After calibration (link axis)         : %8.4f rad\r\n",
-                  last_cmd_link_pos[i]);
-    Serial.printf("  5. After gear ratio, x%.4f (motor axis)  : %8.4f rad\r\n",
-                  GEAR_RATIO[i], last_cmd_motor_pos[i]);
+    if (fb[i].updated) {
+      Serial.printf("  1. Current motor position (measured)     : %8.4f rad\r\n", fb[i].pos);
+      Serial.printf("     current velocity / torque             : %6.2f rad/s  /  %6.2f Nm\r\n", fb[i].vel, fb[i].torque);
+    } else {
+      Serial.println("  1. Current motor position (measured)     : no feedback received yet");
+    }
+
+    Serial.printf("  2. Target position from UDP (link axis)  : %8.4f rad  (clamped %lu time(s) this period, raw request=%.4f)\r\n",
+                  ext_target_pos[i], (unsigned long)range_clamp_count[i], last_udp_target_raw[i]);
+    Serial.printf("  3. This motor's calibration offset       : %+.4f rad  (sign=%+.1f)\r\n",
+                  calib[i].offset, calib[i].sign);
+    Serial.printf("  4. This motor's gear ratio                : x%.4f\r\n",
+                  GEAR_RATIO[i]);
+    Serial.printf("  5. Final position (offset+gear applied)  : %8.4f rad (motor axis)   <- computed, full precision\r\n",
+                  last_cmd_motor_pos[i]);
 
     if (last_can_sent[i]) {
       uint16_t p_raw = (last_can_buf[i][0] << 8) | last_can_buf[i][1];
       float encoded_pos = uintToFloat(p_raw, P_MIN, P_MAX);
-      uint16_t t_raw = (last_can_id[i] >> 8) & 0xFFFF;
-      float encoded_ff = uintToFloat(t_raw, T_MIN, T_MAX);
-      Serial.printf("  6. Actually sent on CAN bus (motor axis) : %8.4f rad  [SENT]  (id=0x%08lX, feed-forward torque=%.3f Nm)\r\n",
-                    encoded_pos, (unsigned long)last_can_id[i], encoded_ff);
+      Serial.printf("  6. Final position as packed into CAN     : %8.4f rad (motor axis)   <- compare with #5 (quantization)  [SENT]\r\n",
+                    encoded_pos);
     } else {
-      Serial.printf("  6. Actually sent on CAN bus              : DROPPED, not sent  (outside +-%.1f rad raw limit, %lu drop(s) this period)\r\n",
+      Serial.printf("  6. Final position as packed into CAN     : DROPPED, not sent  (outside +-%.1f rad raw limit, %lu drop(s) this period)\r\n",
                     RAW_LIMIT_MAX, (unsigned long)raw_drop_count[i]);
-    }
-
-    if (fb[i].updated) {
-      Serial.printf("  7. Motor feedback, measured (motor axis) : %8.4f rad\r\n", fb[i].pos);
-      Serial.printf("     Motor feedback, measured (link axis)  : %8.4f rad  (= feedback / gear ratio)\r\n",
-                    fb[i].pos / GEAR_RATIO[i]);
-      Serial.printf("     Motor feedback velocity / torque      : %6.2f rad/s  /  %6.2f Nm\r\n", fb[i].vel, fb[i].torque);
-    } else {
-      Serial.println("  7. Motor feedback                        : none received since last command sent");
     }
 
     range_clamp_count[i] = 0;
@@ -566,9 +592,14 @@ void setup() {
                 JOINT_CAN_IDS[0], JOINT_CAN_IDS[1], JOINT_CAN_IDS[2], JOINT_CAN_IDS[3]);
   Serial.printf("Static IP       : %d.%d.%d.%d\r\n", ip[0], ip[1], ip[2], ip[3]);
   Serial.printf("UDP Port        : %d\r\n", UDP_PORT);
+  Serial.printf("Debug mode      : %s (LOG_PERIOD after 'e' enable: %lums)\r\n",
+                enable_debug ? "ON" : "OFF",
+                (unsigned long)(enable_debug ? DEBUG_LOG_PERIOD_MS : NORMAL_LOG_PERIOD_MS));
   Serial.println("Serial commands : d=disable");
-  Serial.println("                  e=pose arm to sim default pose by hand, THEN press e");
-  Serial.println("                    -> enables motors + auto-computes calib[] offsets once");
+  Serial.println("                  e=enable all motors (does NOT calibrate)");
+  Serial.println("                  c=pose arm to sim default pose by hand, THEN press c");
+  Serial.println("                    -> computes/applies calib[] offsets from current motor feedback");
+  Serial.println("                       (works enabled or disabled; feedback is always kept live)");
   Serial.println("                  p=pause/resume periodic status log");
   Serial.println("                  g=toggle real-time PLOT,... CSV stream (for plot_positions.py)");
   Serial.println("                  f=attempt fault reset on all motors (stop->re-enable->stop)");
@@ -631,10 +662,18 @@ void loop() {
     }
   }
 
-  // 20ms 제어 루프 (50Hz)
+  // 20ms 제어 루프 (50Hz). teensy-forte teleop-bi의 메인 루프와 동일한 구조:
+  // 매 tick마다 조인트당 정확히 한 번, "활성 제어중이면 실제 명령 / 아니면 무저항(kp=kd=0)
+  // 프로브"를 무조건 보낸다 (enable 여부와 무관). 이 한 번의 Type1 프레임이 명령이자 동시에
+  // 피드백 요청이므로 fb[]는 항상 최신으로 유지된다.
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
+    // fb[i].updated는 여기서 리셋하지 않는다. 이 tick에서 방금 보낸 명령의 응답은 다음 tick
+    // 이후에나 rxCallback()으로 들어오므로, 매 tick 시작 시점에 false로 지워버리면 바로 아래
+    // logStatus()가 그 값을 읽을 기회가 전혀 없다 (실측: mode2 피드백은 계속 들어오는데도
+    // 로그에는 항상 "no feedback received yet"으로 찍히는 버그였음). rxCallback()이 실제
+    // 응답을 받을 때만 true로 세팅하고, 그 이후 계속 true로 유지되는 것으로 충분하다.
     if (ext_control_active && (millis() - last_packet_time < WATCHDOG_TIMEOUT_MS)) {
 
       float target_vel = 0.0f;
@@ -660,7 +699,6 @@ void loop() {
         last_cmd_link_pos[i] = link_pos[i];
         last_cmd_motor_pos[i] = motor_pos;
         last_cmd_ff_torque[i] = feed_forward_torque;
-        fb[i].updated = false; // 이번 명령에 대한 응답이 왔는지 로그에서 확인하기 위해 리셋
 
         operationControl(JOINT_CAN_IDS[i], feed_forward_torque, motor_pos, target_vel, kp, kd);
       }
@@ -681,6 +719,12 @@ void loop() {
         for (int i = 0; i < NUM_JOINTS; i++) {
           disableMotor(JOINT_CAN_IDS[i]);
         }
+        LOG_PERIOD_MS = NORMAL_LOG_PERIOD_MS; // disable 시 debug 촘촘 로그 주기 해제, 평소 주기로 복귀
+      }
+
+      // 활성 제어중이 아닐 때도 무저항 프로브로 피드백은 계속 요청한다 (teleop-bi와 동일)
+      for (int i = 0; i < NUM_JOINTS; i++) {
+        operationControl(JOINT_CAN_IDS[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
       }
     }
 
@@ -692,7 +736,9 @@ void loop() {
 }
 
 // 시리얼 명령 수동 제어
-// E: 로봇팔을 SIM_DEFAULT_LINK_POS 자세로 손으로 맞춘 뒤 누르면 전체 모터 enable + 오프셋 1회 자동 계산
+// E: 전체 모터 enable (MIT run mode). 캘리브레이션은 하지 않음 (C로 분리됨)
+// C: 로봇팔을 SIM_DEFAULT_LINK_POS 자세로 손으로 맞춘 뒤 누르면 calib[].offset 계산/적용
+//    (enable 여부와 무관하게 언제든 실행 가능 - 모터 피드백은 항상 최신으로 유지되고 있음)
 // D: 전체 끄기
 // P: 주기 상태 로그(logStatus) 출력 일시정지/재개 토글 (모터 제어/UDP 수신에는 영향 없음)
 // G: 실시간 위치 CSV(PLOT,...) 스트림 토글 (plot_positions.py가 이 출력을 파싱함)
@@ -704,11 +750,18 @@ void serialEvent() {
       for (int i = 0; i < NUM_JOINTS; i++) {
         disableMotor(JOINT_CAN_IDS[i]);
       }
+      LOG_PERIOD_MS = NORMAL_LOG_PERIOD_MS; // disable 시 debug 촘촘 로그 주기 해제, 평소 주기로 복귀
     } else if (ch == 'e' || ch == 'E') {
       for (int i = 0; i < NUM_JOINTS; i++) {
         enableMotor(JOINT_CAN_IDS[i]);
         delay(20); // CAN 버스 연속 명령 안정성을 위한 미세 딜레이
       }
+      LOG_PERIOD_MS = enable_debug ? DEBUG_LOG_PERIOD_MS : NORMAL_LOG_PERIOD_MS;
+      if (enable_debug) {
+        Serial.printf("[Teensy] enable_debug=true -> LOG_PERIOD_MS=%lums (dense logging). Press 'p' to pause and inspect.\r\n",
+                      (unsigned long)LOG_PERIOD_MS);
+      }
+    } else if (ch == 'c' || ch == 'C') {
       computeCalibOffsets();
     } else if (ch == 'p' || ch == 'P') {
       serialLogPaused = !serialLogPaused;
@@ -726,6 +779,7 @@ void serialEvent() {
         disableMotor(JOINT_CAN_IDS[i]);
         delay(20);
       }
+      LOG_PERIOD_MS = NORMAL_LOG_PERIOD_MS; // disable 시 debug 촘촘 로그 주기 해제, 평소 주기로 복귀
     }
   }
 }
