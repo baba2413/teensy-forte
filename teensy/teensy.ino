@@ -2,14 +2,16 @@
 #include <FlexCAN_T4.h>
 
 // -------------------------------------------------------------
-// shoulder_pitch (CAN ID 13) 단독 확인용 테스트 코드
-// - 'e' : 모터 enable + 현재 위치 읽기 -> 그 위치부터 천천히 음의 방향으로 회전 시작
-// - 'd' : 모터 disable + 회전 정지
+// 여러 모터 동시 확인용 테스트 코드
+// - 'e' : 모든 모터 enable + 각자의 현재 위치 읽기 -> 그 위치부터 천천히
+//         음의 방향으로 동일한 명령(작은 회전)을 동시에 송신 시작
+// - 'd' : 모든 모터 disable + 회전 정지
 // -------------------------------------------------------------
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
 
-const uint8_t MOTOR_ID = 14;   // shoulder_pitch
+const uint8_t MOTOR_IDS[] = {11, 13};
+const uint8_t NUM_MOTORS = sizeof(MOTOR_IDS) / sizeof(MOTOR_IDS[0]);
 const uint8_t HOST_ID = 253;
 
 // Robstride 프로토콜 물리적 한계값 (MIT 모드 패킹용)
@@ -40,31 +42,37 @@ struct MotorFeedback {
   float torque;
   bool updated;
 };
-MotorFeedback fb = {0, 0, 0, false};
+MotorFeedback fb[NUM_MOTORS];
 
 bool running = false;
-float start_pos = 0.0f;
-float target_pos = 0.0f;
+float start_pos[NUM_MOTORS];
+float target_pos[NUM_MOTORS];
 
 // -------------------------------------------------------------
-// 진단용 상태 (회전 안 하는 원인 분석용)
+// 진단용 상태 (회전 안 하는 원인 분석용, 모터별)
 // -------------------------------------------------------------
-volatile uint32_t rx_total_count = 0;      // 수신된 모든 CAN 프레임 수 (mode/ID 무관)
-volatile uint32_t rx_mode2_count = 0;      // mode==2(피드백) 프레임 수 (ID 무관)
-volatile uint32_t rx_matched_count = 0;    // mode==2 이면서 motor_id==MOTOR_ID인 프레임 수
-volatile uint32_t last_rx_id = 0;          // 가장 최근 수신된 프레임의 raw CAN ID (mode/ID 무관)
-volatile uint32_t last_rx_ms = 0;          // 가장 최근 수신 시각
+volatile uint32_t rx_total_count = 0;                    // 수신된 모든 CAN 프레임 수 (mode/ID 무관)
+volatile uint32_t rx_mode2_count = 0;                     // mode==2(피드백) 프레임 수 (ID 무관)
+volatile uint32_t rx_matched_count[NUM_MOTORS] = {0};      // mode==2 이면서 해당 motor_id인 프레임 수
+volatile uint32_t last_rx_id = 0;                          // 가장 최근 수신된 프레임의 raw CAN ID (mode/ID 무관)
+volatile uint32_t last_rx_ms = 0;                          // 가장 최근 수신 시각
 
-volatile uint8_t fault_bits = 0;           // Type2 피드백의 fault 비트 (bits 21-16, 6bit)
-volatile uint8_t motor_run_mode = 0;       // Type2 피드백의 모터 상태 (bits 23-22): 0=Reset,1=Cali,2=Run
-volatile bool fault_changed = false;
+volatile uint8_t fault_bits[NUM_MOTORS] = {0};             // Type2 피드백의 fault 비트 (bits 21-16, 6bit)
+volatile uint8_t motor_run_mode[NUM_MOTORS] = {0};         // Type2 피드백의 모터 상태 (bits 23-22): 0=Reset,1=Cali,2=Run
 
 uint32_t tx_control_count = 0;             // operationControl() 호출(=CAN TX 시도) 횟수
 uint32_t last_can_id_tx = 0;
 uint8_t last_can_buf_tx[8] = {0};
 
-void printFaultBits(uint8_t bits) {
-  Serial.printf("[FAULT] Motor %d | Raw: 0x%02X", MOTOR_ID, bits);
+int motorIndex(uint8_t motor_id) {
+  for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+    if (MOTOR_IDS[i] == motor_id) return i;
+  }
+  return -1;
+}
+
+void printFaultBits(uint8_t motor_id, uint8_t bits) {
+  Serial.printf("[FAULT] Motor %d | Raw: 0x%02X", motor_id, bits);
   if (bits == 0) {
     Serial.println(" | CLEARED");
     return;
@@ -103,23 +111,21 @@ void rxCallback(const CAN_message_t &msg) {
   uint8_t new_fault = (msg.id >> 16) & 0x3F;
   uint8_t new_run_mode = (msg.id >> 22) & 0x03;
 
-  if (motor_id != MOTOR_ID) return;
-  rx_matched_count++;
+  int idx = motorIndex(motor_id);
+  if (idx < 0) return;
+  rx_matched_count[idx]++;
 
-  if (new_fault != fault_bits) {
-    fault_bits = new_fault;
-    fault_changed = true;
-  }
-  motor_run_mode = new_run_mode;
+  fault_bits[idx] = new_fault;
+  motor_run_mode[idx] = new_run_mode;
 
   uint16_t p_raw = (msg.buf[0] << 8) | msg.buf[1];
   uint16_t v_raw = (msg.buf[2] << 8) | msg.buf[3];
   uint16_t t_raw = (msg.buf[4] << 8) | msg.buf[5];
 
-  fb.pos = uintToFloat(p_raw, P_MIN, P_MAX);
-  fb.vel = uintToFloat(v_raw, V_MIN, V_MAX);
-  fb.torque = uintToFloat(t_raw, T_MIN, T_MAX);
-  fb.updated = true;
+  fb[idx].pos = uintToFloat(p_raw, P_MIN, P_MAX);
+  fb[idx].vel = uintToFloat(v_raw, V_MIN, V_MAX);
+  fb[idx].torque = uintToFloat(t_raw, T_MIN, T_MAX);
+  fb[idx].updated = true;
 }
 
 void enableMotor(uint8_t motor_id) {
@@ -174,29 +180,34 @@ void operationControl(uint8_t motor_id, float feed_forward, float pos, float vel
   memcpy(last_can_buf_tx, msg.buf, 8);
 }
 
-// enable 직후 1회: 무저항(zero-gain) 프로브 프레임으로 현재 위치를 읽는다.
-float readCurrentPos() {
-  fb.updated = false;
-  operationControl(MOTOR_ID, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+// enable 직후: 모든 모터에 무저항(zero-gain) 프로브 프레임을 보내 현재 위치를 읽는다.
+void readAllCurrentPos() {
+  for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+    fb[i].updated = false;
+    operationControl(MOTOR_IDS[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  }
 
   uint32_t waitStart = millis();
   while (millis() - waitStart < 100) {
     Can0.events();
   }
 
-  if (!fb.updated) {
-    Serial.println("[WARN] 현재 위치 피드백을 받지 못했습니다. 0으로 시작합니다.");
-    Serial.printf("       rx_total=%lu rx_mode2=%lu rx_matched=%lu (motor_id=%d 프레임이 안 들어오면 배선/보드레이트/ID 문제)\r\n",
-                  (unsigned long)rx_total_count, (unsigned long)rx_mode2_count, (unsigned long)rx_matched_count, MOTOR_ID);
-    if (rx_total_count > 0) {
-      Serial.printf("       마지막 수신 프레임 id=0x%08lX (%lums 전)\r\n",
-                    (unsigned long)last_rx_id, (unsigned long)(millis() - last_rx_ms));
+  for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+    uint8_t motor_id = MOTOR_IDS[i];
+    if (!fb[i].updated) {
+      Serial.printf("[WARN] Motor %d 현재 위치 피드백을 받지 못했습니다. 0으로 시작합니다.\r\n", motor_id);
+      Serial.printf("       rx_total=%lu rx_mode2=%lu rx_matched=%lu (motor_id=%d 프레임이 안 들어오면 배선/보드레이트/ID 문제)\r\n",
+                    (unsigned long)rx_total_count, (unsigned long)rx_mode2_count,
+                    (unsigned long)rx_matched_count[i], motor_id);
+      start_pos[i] = 0.0f;
+    } else {
+      Serial.printf("[Teensy] Motor %d 현재 위치 확인됨 = %.4f rad. run_mode=%d fault=0x%02X\r\n",
+                    motor_id, fb[i].pos, motor_run_mode[i], fault_bits[i]);
+      printFaultBits(motor_id, fault_bits[i]);
+      start_pos[i] = fb[i].pos;
     }
-    return 0.0f;
+    target_pos[i] = start_pos[i];
   }
-  Serial.printf("[Teensy] 현재 위치 확인됨. run_mode=%d fault=0x%02X\r\n", motor_run_mode, fault_bits);
-  printFaultBits(fault_bits);
-  return fb.pos;
 }
 
 void setup() {
@@ -211,9 +222,11 @@ void setup() {
   Can0.onReceive(rxCallback);
 
   Serial.println("==================================================");
-  Serial.println("[Teensy] shoulder_pitch (CAN ID 13) 단독 확인용 코드");
-  Serial.println("e = enable (현재 위치부터 천천히 음의 방향으로 회전 시작)");
-  Serial.println("d = disable (정지)");
+  Serial.printf("[Teensy] 다중 모터(%d개) 동시 확인용 코드: ", NUM_MOTORS);
+  for (uint8_t i = 0; i < NUM_MOTORS; i++) Serial.printf("%d ", MOTOR_IDS[i]);
+  Serial.println();
+  Serial.println("e = enable (모든 모터가 각자의 현재 위치부터 동일한 명령으로 천천히 음의 방향 회전 시작)");
+  Serial.println("d = disable (모든 모터 정지)");
   Serial.println("==================================================");
 
   controlTimer = 0;
@@ -225,15 +238,14 @@ void loop() {
   if (Serial.available()) {
     char ch = Serial.read();
     if (ch == 'e' || ch == 'E') {
-      enableMotor(MOTOR_ID);
+      for (uint8_t i = 0; i < NUM_MOTORS; i++) enableMotor(MOTOR_IDS[i]);
       delay(20);
-      start_pos = readCurrentPos();
-      target_pos = start_pos;
+      readAllCurrentPos();
       running = true;
-      Serial.printf("[Teensy] 시작 위치 = %.4f rad. 음의 방향으로 회전을 시작합니다.\r\n", start_pos);
+      Serial.println("[Teensy] 모든 모터가 동일한 명령으로 음의 방향 회전을 시작합니다.");
     } else if (ch == 'd' || ch == 'D') {
       running = false;
-      disableMotor(MOTOR_ID);
+      for (uint8_t i = 0; i < NUM_MOTORS; i++) disableMotor(MOTOR_IDS[i]);
     }
   }
 
@@ -242,19 +254,24 @@ void loop() {
 
     if (running) {
       float step = ROTATE_SPEED * (CONTROL_PERIOD_US / 1000000.0f);
-      float min_target = start_pos - ROTATE_RANGE_LIMIT;
-      if (target_pos > min_target) {
-        target_pos -= step;
-        if (target_pos < min_target) target_pos = min_target;
+      for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        float min_target = start_pos[i] - ROTATE_RANGE_LIMIT;
+        if (target_pos[i] > min_target) {
+          target_pos[i] -= step;
+          if (target_pos[i] < min_target) target_pos[i] = min_target;
+        }
+        operationControl(MOTOR_IDS[i], 0.0f, target_pos[i], 0.0f, KP, KD);
       }
-
-      operationControl(MOTOR_ID, 0.0f, target_pos, 0.0f, KP, KD);
     }
 
     if (millis() - lastLogMs >= LOG_PERIOD_MS) {
       lastLogMs = millis();
-      Serial.printf("[STATUS] running=%d target=%.4f fb_pos=%.4f fb_vel=%.4f fb_trq=%.4f %s\r\n",
-                    running, target_pos, fb.pos, fb.vel, fb.torque, fb.updated ? "FB_OK" : "FB_NONE");
+      Serial.printf("[STATUS] running=%d\r\n", running);
+      for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+        Serial.printf("  Motor %2d: target=%.4f fb_pos=%.4f fb_vel=%.4f fb_trq=%.4f %s\r\n",
+                      MOTOR_IDS[i], target_pos[i], fb[i].pos, fb[i].vel, fb[i].torque,
+                      fb[i].updated ? "FB_OK" : "FB_NONE");
+      }
     }
   }
 }
