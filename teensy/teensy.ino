@@ -388,7 +388,11 @@ void calibrateZero() {
       continue;
     }
     zero_offset_can1[i] = slave_pos_can1[i];
-    Serial.printf("[CALIB] Motor %d zero = %.3f rad\r\n", SLV_IDS_CAN1[i], zero_offset_can1[i]);
+    // format: radian_after_calibration (original_radian) -- always 0.000 right here (the new
+    // zero IS the current pose by definition), but kept consistent with the status-print format
+    // below so the same convention holds everywhere a calibration-relative reading is logged.
+    Serial.printf("[CALIB] Motor %d zero set: %.3f (%.3f) rad\r\n",
+                  SLV_IDS_CAN1[i], slave_pos_can1[i] - zero_offset_can1[i], slave_pos_can1[i]);
   }
   for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
     if (!slave_valid_can2[i]) {
@@ -397,7 +401,8 @@ void calibrateZero() {
       continue;
     }
     zero_offset_can2[i] = slave_pos_can2[i];
-    Serial.printf("[CALIB] Motor %d zero = %.3f rad\r\n", SLV_IDS_CAN2[i], zero_offset_can2[i]);
+    Serial.printf("[CALIB] Motor %d zero set: %.3f (%.3f) rad\r\n",
+                  SLV_IDS_CAN2[i], slave_pos_can2[i] - zero_offset_can2[i], slave_pos_can2[i]);
   }
 
   is_calibrated = all_ok;
@@ -631,15 +636,23 @@ void loop() {
       const char* mode_str = goal_mode_enabled ? "GOAL" : "DISABLED";
       const char* calib_str = is_calibrated ? "CALIB_OK" : "NO_CALIB";
 
+      // format: radian_after_calibration (original_radian) -- lets you read a position directly
+      // against JOINT_LIMIT_MIN/MAX_CAN1/CAN2 (defined relative to zero_offset_*) without doing
+      // the subtraction in your head. When NOT calibrated, zero_offset_* is still 0.0 (never
+      // written), so both numbers come out equal -- that's expected, not a bug.
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-        Serial.printf("[CAN1] Slave %d Pos: %.3f rad | Target: %.3f rad (%s / %s) | Trq: %.2f Nm\r\n",
-                      SLV_IDS_CAN1[i], slave_pos_can1[i], goal_target_can1[i], mode_str, calib_str,
-                      slave_trq_can1[i]);
+        Serial.printf("[CAN1] Slave %d Pos: %.3f (%.3f) rad | Target: %.3f (%.3f) rad (%s / %s) | Trq: %.2f Nm\r\n",
+                      SLV_IDS_CAN1[i],
+                      slave_pos_can1[i] - zero_offset_can1[i], slave_pos_can1[i],
+                      goal_target_can1[i] - zero_offset_can1[i], goal_target_can1[i],
+                      mode_str, calib_str, slave_trq_can1[i]);
       }
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-        Serial.printf("[CAN2] Slave %d Pos: %.3f rad | Target: %.3f rad (%s / %s) | Trq: %.2f Nm\r\n",
-                      SLV_IDS_CAN2[i], slave_pos_can2[i], goal_target_can2[i], mode_str, calib_str,
-                      slave_trq_can2[i]);
+        Serial.printf("[CAN2] Slave %d Pos: %.3f (%.3f) rad | Target: %.3f (%.3f) rad (%s / %s) | Trq: %.2f Nm\r\n",
+                      SLV_IDS_CAN2[i],
+                      slave_pos_can2[i] - zero_offset_can2[i], slave_pos_can2[i],
+                      goal_target_can2[i] - zero_offset_can2[i], goal_target_can2[i],
+                      mode_str, calib_str, slave_trq_can2[i]);
       }
 
       if (goal_mode_enabled) {
