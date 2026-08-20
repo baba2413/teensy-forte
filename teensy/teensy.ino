@@ -56,6 +56,15 @@ const float SLV_KD = 0.2f;
 // 스트림보다 UDP 쪽이 패킷 유실 특성이 다르므로, 이전 시리얼 버전의 150ms보다 여유를 둔다.
 const uint32_t GOAL_TIMEOUT_MS = 500;
 
+// 'd' 직후 이 시간(ms) 동안은 들어오는 UDP 목표 패킷을 전부 무시한다. UDP(목표 스트림)와
+// 시리얼('d')은 서로 동기화되지 않는 완전히 별개의 채널이라, 'd'를 보내기 직전에 호스트가
+// 이미 보내둔 목표 패킷이 'd' 처리 *이후*에 도착할 수 있다 -- handleGoalPacket()은 원래
+// 유효한 패킷이면 무조건 enterGoalModeIfNeeded()를 부르므로, 이 stray 패킷 하나가 방금 건
+// 'd'를 무효화하고 (심지어 캘리브레이션도 안 된 채로) 모터를 재활성화해버린다. 실측으로
+// 재현된 문제 -- 'd'는 순간적인 킬 스위치여야 하므로, 짧은 무시 구간으로 이 경합을 막는다.
+const uint32_t DISABLE_IGNORE_MS = 300;
+uint32_t ignore_goal_packets_until_ms = 0;
+
 // 네트워크 설정 (isaacsim-udp 브랜치와 동일 -- 실제로 이 하드웨어에서 검증된 설정을 그대로 사용).
 // 직결 케이블 전제라 게이트웨이는 없음(0.0.0.0).
 IPAddress staticIP(192, 168, 1, 15);
@@ -450,6 +459,13 @@ void enterGoalModeIfNeeded() {
 // 스크립트이고, 완전한 4개 값을 보내는 것이 자연스럽다 (현재 위치를 유지하고 싶으면 호출자가
 // 그 값을 그대로 다시 보내면 된다).
 void handleGoalPacket(char* buf) {
+  if (millis() < ignore_goal_packets_until_ms) {
+    // 'd' 직후 무시 구간 -- DISABLE_IGNORE_MS 참고. 'd' 이전에 이미 보내진 stray 패킷이
+    // 뒤늦게 도착해 방금 건 disable을 무효화하는 걸 막는다.
+    Serial.println("[Teensy] GOAL packet ignored (just disabled, dropping stragglers briefly).");
+    return;
+  }
+
   float values[4];
   int i = 0;
   char* token = strtok(buf, ",");
@@ -674,6 +690,7 @@ void serialEvent() {
     else if (ch == 'd' || ch == 'D') {
       goal_mode_enabled = false;
       is_calibrated = false; // full stop invalidates the zero reference -- re-'c' before trusting it again
+      ignore_goal_packets_until_ms = millis() + DISABLE_IGNORE_MS; // drop stragglers, see DISABLE_IGNORE_MS
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
         disableMotorCan1(SLV_IDS_CAN1[i]); delay(20);
