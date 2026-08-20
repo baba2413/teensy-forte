@@ -46,6 +46,13 @@ const float SLV_KD = 0.2f;
 const uint32_t GOAL_TIMEOUT_MS = 150;  // 이 시간 안에 새 'g' 라인이 없으면 자동 정지
 const uint8_t GOAL_LINE_BUF_SIZE = 64; // 'g' 명령 한 줄의 최대 길이
 
+// 'g' 라인 수신 중 이 시간(ms) 동안 새 바이트가 없으면, 지금까지 받은 내용을 완결된 라인으로
+// 간주하고 처리한다. 터미널로 사람이 'g' 한 글자만 치고 Enter/CR/LF를 아예 안 보내는 경우
+// (스페이스바 뒤 숫자도, 개행도 안 오는 경우) 이게 없으면 receiving_goal_line이 영원히 true로
+// 남는다. 사람 기준으로는 체감상 즉각(<0.1초)이면서, 파이썬이 한 번에 쓰는 'g <4개 float>\n'
+// 라인(USB로 보통 수 ms 안에 통째로 도착)보다는 충분히 길게 잡는다.
+const uint32_t GOAL_LINE_IDLE_MS = 50;
+
 // 'c' 소프트웨어 영점 + 관절별 이동 한계 (teensy-forte teleop-bi 브랜치의 "modify" 커밋에서
 // 포팅, raw 모터 라디안 기준으로 재구성) -- 이 펌웨어는 기어비를 전혀 적용하지 않으므로
 // (lerobot_robot_forte_arm의 SMOLVLA_GUIDE.md §2 참고) 원본의 관절-공간/기어비 나눗셈은
@@ -462,6 +469,30 @@ void handleGoalLine(const char* line, uint8_t len) {
 }
 
 // -------------------------------------------------------------
+// 9b. 'g' 라인 수신 버퍼 및 idle 타임아웃 완결 처리
+//
+// loop()가 GOAL_LINE_IDLE_MS 타임아웃을 확인하려면 이 상태를 알아야 하므로, serialEvent()
+// (섹션 11, loop() 다음에 옴)보다 앞에 둔다.
+// -------------------------------------------------------------
+bool receiving_goal_line = false;
+bool goal_line_overflowed = false;
+char goal_line_buf[GOAL_LINE_BUF_SIZE];
+uint8_t goal_line_len = 0;
+uint32_t last_goal_byte_ms = 0; // GOAL_LINE_IDLE_MS 타임아웃 기준 시각
+
+void finalizeGoalLine() {
+  goal_line_buf[goal_line_len] = '\0';
+  if (goal_line_overflowed) {
+    Serial.println("[Teensy] GOAL line REJECTED (too long, buffer overflow).");
+  } else {
+    handleGoalLine(goal_line_buf, goal_line_len);
+  }
+  receiving_goal_line = false;
+  goal_line_overflowed = false;
+  goal_line_len = 0;
+}
+
+// -------------------------------------------------------------
 // 10. 메인 루프 구조
 // -------------------------------------------------------------
 void setup() {
@@ -497,6 +528,13 @@ void setup() {
 void loop() {
   Can1.events();
   Can2.events();
+
+  // 'g' 라인이 GOAL_LINE_IDLE_MS 동안 완결되지 않으면 지금까지 받은 걸로 완결 처리한다.
+  // serialEvent()는 새 바이트가 있어야만 호출되므로, "더 이상 바이트가 안 온다"는 상황 자체는
+  // 여기 loop()에서만 감지할 수 있다 (매 iteration 확인 -- CONTROL_PERIOD_US 게이트 밖).
+  if (receiving_goal_line && (millis() - last_goal_byte_ms > GOAL_LINE_IDLE_MS)) {
+    finalizeGoalLine();
+  }
 
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     uint8_t motor_id = SLV_IDS_CAN1[i];
@@ -617,17 +655,19 @@ void loop() {
 // -------------------------------------------------------------
 // 11. 시리얼 명령 수신 인터럽트
 //
-// 'd'는 단일 문자 명령. 'g'는 그 뒤로 같은 줄에 4개의 float를 받을 수도 있는(또는 아무것도
-// 없이 개행만 올 수도 있는) 라인형 명령이라, 'g'를 본 순간부터 '\n' 또는 '\r'을 볼 때까지
-// 별도 버퍼에 누적한다. serialEvent()는 loop() 1회당 1번만 호출되는 Arduino 코어 콜백이므로, 그 안에서
-// 그 시점에 도착해 있는 바이트를 전부 소진해야 (1 tick당 1바이트만 읽으면) 멀티바이트 라인의
-// 수신 지연이 커진다.
+// 'c'/'d'는 단일 문자 명령, 즉시 처리된다. 'g'는 그 뒤로 같은 줄에 4개의 float를 받을 수도
+// 있는(또는 아무것도 없이 개행만 올 수도 있는) 라인형 명령이라, 'g'를 본 순간부터 종료 조건을
+// 볼 때까지 별도 버퍼에 누적한다 (globals + finalizeGoalLine()은 9b 섹션, loop()가 idle
+// 타임아웃 확인을 위해 참조해야 해서 loop()보다 앞으로 옮겨뒀다). 종료 조건은 둘 중 하나:
+//   1. '\n' 또는 '\r' 수신 (파이썬처럼 완전한 줄을 한 번에 보내는 쪽)
+//   2. GOAL_LINE_IDLE_MS 동안 새 바이트가 안 옴 (사람이 터미널에서 'g' 한 글자만 치고
+//      Enter/CR/LF를 전혀 안 보내는 경우 -- 이게 없으면 receiving_goal_line이 영영 true로
+//      남아 이후 모든 입력('c', 'd' 포함)이 커맨드로 처리되지 못하고 조용히 라인 버퍼에
+//      먹혀버린다. 실제로 겪은 버그.)
+//
+// serialEvent()는 loop() 1회당 1번만 호출되는 콜백이므로, 그 안에서 그 시점에 도착해 있는
+// 바이트를 전부 소진해야 (1 tick당 1바이트만 읽으면) 멀티바이트 라인의 수신 지연이 커진다.
 // -------------------------------------------------------------
-bool receiving_goal_line = false;
-bool goal_line_overflowed = false;
-char goal_line_buf[GOAL_LINE_BUF_SIZE];
-uint8_t goal_line_len = 0;
-
 void serialEvent() {
   while (Serial.available()) {
     char ch = Serial.read();
@@ -653,28 +693,22 @@ void serialEvent() {
         receiving_goal_line = true;
         goal_line_overflowed = false;
         goal_line_len = 0;
+        last_goal_byte_ms = millis();
       }
       // 그 외 문자(공백, 개행 등)는 명령 시작 문자가 아니므로 무시.
     } else {
       // 'g' 라인 누적 중. '\n'과 '\r' 둘 다 라인 종료로 취급한다 -- screen 등 일부 시리얼
       // 터미널은 Enter에 '\r'만 보내고 '\n'은 절대 안 보내므로, '\r'을 종료자로 인정하지
-      // 않으면 receiving_goal_line이 영영 true로 남아 이후 모든 입력(예: 'c', 'd')이
-      // 커맨드로 처리되지 못하고 조용히 라인 버퍼에 먹혀버린다 (사용자가 직접 겪은 버그).
+      // 않으면 receiving_goal_line이 영영 true로 남을 수 있다 (GOAL_LINE_IDLE_MS 타임아웃이
+      // 결국 구제해주긴 하지만, '\r'도 종료자로 받아주면 그마저 기다릴 필요가 없다).
       // 진짜 CRLF("\r\n")가 오면 '\r'에서 라인이 끝나고, 뒤따라온 '\n'은
       // !receiving_goal_line 상태에서 c/d/g 어느 것과도 안 맞아 그냥 무시된다 -- 중복 처리 없음.
       if (ch == '\n' || ch == '\r') {
-        goal_line_buf[goal_line_len] = '\0';
-        if (goal_line_overflowed) {
-          Serial.println("[Teensy] GOAL line REJECTED (too long, buffer overflow).");
-        } else {
-          handleGoalLine(goal_line_buf, goal_line_len);
-        }
-        receiving_goal_line = false;
-        goal_line_overflowed = false;
-        goal_line_len = 0;
+        finalizeGoalLine();
       } else if (!goal_line_overflowed) {
         if (goal_line_len < GOAL_LINE_BUF_SIZE - 1) {
           goal_line_buf[goal_line_len++] = ch;
+          last_goal_byte_ms = millis();
         } else {
           goal_line_overflowed = true; // 다음 '\n' 또는 '\r'까지 나머지는 버림 (resync)
         }
