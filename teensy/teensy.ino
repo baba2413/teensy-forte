@@ -12,6 +12,10 @@
 // this repo is a standalone snapshot for one job, not layers meant to be combined.
 //
 // Serial protocol (single-char command, 'g' takes a payload line):
+//   c                          -> calibrate: capture current pose as each motor's software zero
+//                                 (offset only, not a physical move). Required for the per-joint
+//                                 limit clamp (JOINT_LIMIT_MIN/MAX_CAN1/CAN2) to be enforced --
+//                                 without it, only the wide +-12.4 rad protocol limit applies.
 //   g\n                        -> enter GOAL mode, holding the arm's current position
 //   g <p0> <p1> <p2> <p3>\n    -> enter/refresh GOAL mode, set the 4 joint targets
 //                                 (raw motor radians, order = shoulder_yaw, shoulder_pitch,
@@ -19,7 +23,8 @@
 //                                 note 12/13 are swapped relative to CAN wiring order, since
 //                                 the kinematic joint order is yaw->pitch->roll->elbow, not the
 //                                 order the CAN ids happen to be wired in)
-//   d                          -> disable (zero-torque, stop)
+//   d                          -> disable (zero-torque, stop). Also clears calibration -- 'c'
+//                                 again before 'g' if you want the joint-limit clamp back.
 // -------------------------------------------------------------
 
 // -------------------------------------------------------------
@@ -40,6 +45,19 @@ const float SLV_KD = 0.2f;
 // GOAL 모드 설정
 const uint32_t GOAL_TIMEOUT_MS = 150;  // 이 시간 안에 새 'g' 라인이 없으면 자동 정지
 const uint8_t GOAL_LINE_BUF_SIZE = 64; // 'g' 명령 한 줄의 최대 길이
+
+// 'c' 소프트웨어 영점 + 관절별 이동 한계 (teensy-forte teleop-bi 브랜치의 "modify" 커밋에서
+// 포팅, raw 모터 라디안 기준으로 재구성) -- 이 펌웨어는 기어비를 전혀 적용하지 않으므로
+// (lerobot_robot_forte_arm의 SMOLVLA_GUIDE.md §2 참고) 원본의 관절-공간/기어비 나눗셈은
+// 가져오지 않았다. 'c'로 잡은 현재 raw 위치가 그 모터의 영점이 되고, 이후 목표값은
+// [영점 + MIN, 영점 + MAX] 범위로 클램프된다.
+//
+// TODO: 아래 값은 PLACEHOLDER (영점 기준 +-1.0 rad)다. 실제 팔의 물리적으로 검증된 안전
+// 가동 범위로 반드시 교체할 것 -- 지금 값으로는 실제 안전한계로 신뢰하면 안 된다.
+const float JOINT_LIMIT_MIN_CAN1[NUM_MOTORS_CAN1] = {-1.0f, -1.0f};
+const float JOINT_LIMIT_MAX_CAN1[NUM_MOTORS_CAN1] = { 1.0f,  1.0f};
+const float JOINT_LIMIT_MIN_CAN2[NUM_MOTORS_CAN2] = {-1.0f, -1.0f};
+const float JOINT_LIMIT_MAX_CAN2[NUM_MOTORS_CAN2] = { 1.0f,  1.0f};
 
 // Teensy 4.0/4.1 CAN1, CAN2 사용 (모터 11,12는 CAN1 / 13,14는 CAN2 배선)
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
@@ -73,11 +91,18 @@ const uint32_t LOG_PERIOD = 1000;
 // 4. 실시간 상태 및 제어 플래그
 // -------------------------------------------------------------
 bool goal_mode_enabled = false; // 'g'로 진입, 'd'로 해제
+bool is_calibrated = false;     // 'c'로 진입 -- 영점(zero_offset_*)이 현재 유효한지
 
 volatile float slave_pos_can1[NUM_MOTORS_CAN1] = {};
 volatile float slave_trq_can1[NUM_MOTORS_CAN1] = {};
+volatile bool slave_valid_can1[NUM_MOTORS_CAN1] = {}; // CAN 피드백을 한 번이라도 받았는지
 volatile float slave_pos_can2[NUM_MOTORS_CAN2] = {};
 volatile float slave_trq_can2[NUM_MOTORS_CAN2] = {};
+volatile bool slave_valid_can2[NUM_MOTORS_CAN2] = {};
+
+// 'c'로 잡은 영점 (raw 모터 라디안). JOINT_LIMIT_MIN/MAX_CAN1/CAN2가 이 값 기준 상대 범위다.
+float zero_offset_can1[NUM_MOTORS_CAN1] = {};
+float zero_offset_can2[NUM_MOTORS_CAN2] = {};
 
 // GOAL 모드에서 추종할 목표 원시 라디안. 인덱스는 SLV_IDS_CAN1/CAN2 배열과 동일한 순서
 // (CAN 배선 기준: goal_target_can1[0]=11, [1]=12, goal_target_can2[0]=13, [1]=14).
@@ -300,6 +325,7 @@ void rxCallbackCan1(const CAN_message_t &msg) {
       if (motor_id == SLV_IDS_CAN1[i]) {
         slave_pos_can1[i] = current_pos;
         slave_trq_can1[i] = current_trq;
+        slave_valid_can1[i] = true;
         break;
       }
     }
@@ -329,9 +355,44 @@ void rxCallbackCan2(const CAN_message_t &msg) {
       if (motor_id == SLV_IDS_CAN2[i]) {
         slave_pos_can2[i] = current_pos;
         slave_trq_can2[i] = current_trq;
+        slave_valid_can2[i] = true;
         break;
       }
     }
+  }
+}
+
+// -------------------------------------------------------------
+// 8b. 'c' 소프트웨어 영점 캘리브레이션
+// -------------------------------------------------------------
+void calibrateZero() {
+  Serial.println("[Teensy] Calibrating zero offset from current pose...");
+
+  bool all_ok = true;
+  for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
+    if (!slave_valid_can1[i]) {
+      Serial.printf("[CALIB] Motor %d: no CAN feedback yet -- FAILED\r\n", SLV_IDS_CAN1[i]);
+      all_ok = false;
+      continue;
+    }
+    zero_offset_can1[i] = slave_pos_can1[i];
+    Serial.printf("[CALIB] Motor %d zero = %.3f rad\r\n", SLV_IDS_CAN1[i], zero_offset_can1[i]);
+  }
+  for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
+    if (!slave_valid_can2[i]) {
+      Serial.printf("[CALIB] Motor %d: no CAN feedback yet -- FAILED\r\n", SLV_IDS_CAN2[i]);
+      all_ok = false;
+      continue;
+    }
+    zero_offset_can2[i] = slave_pos_can2[i];
+    Serial.printf("[CALIB] Motor %d zero = %.3f rad\r\n", SLV_IDS_CAN2[i], zero_offset_can2[i]);
+  }
+
+  is_calibrated = all_ok;
+  if (all_ok) {
+    Serial.println("[Teensy] Calibration complete. Per-joint limits now active relative to this pose.");
+  } else {
+    Serial.println("[Teensy] Calibration INCOMPLETE -- missing feedback for some motor(s). NOT calibrated.");
   }
 }
 
@@ -353,6 +414,11 @@ void enterGoalModeIfNeeded() {
   goal_mode_enabled = true;
   Serial.println("[Teensy] GOAL mode ENABLED. Send 'g <yaw> <pitch> <roll> <elbow>' (raw rad) "
                   "to move. Send 'd' to stop.");
+  if (!is_calibrated) {
+    Serial.println("[Teensy] WARNING: entering GOAL mode without calibration ('c') -- only the "
+                    "wide +-12.4 rad protocol limit is active, no real per-joint limit. Send 'd' "
+                    "then 'c' first if you want the per-joint clamp enforced.");
+  }
 }
 
 // line은 NUL로 끝나는 문자열, len은 '\n'/'\r' 제외한 실제 길이 (0 가능 -- bare "g\n").
@@ -418,7 +484,8 @@ void setup() {
   Can2.onReceive(rxCallbackCan2);
 
   Serial.println("Teensy CAN1/CAN2 initialized.");
-  Serial.println("-> Send 'g' for goal-position mode, 'd' to disable.");
+  Serial.println("-> Send 'c' to calibrate zero (recommended first), 'g' for goal-position mode, "
+                  "'d' to disable.");
   controlTimer = 0;
 }
 
@@ -470,7 +537,21 @@ void loop() {
     // --- CAN1 제어 ---
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
       if (goal_mode_enabled) {
-        operationControlCan1(SLV_IDS_CAN1[i], 0.0f, goal_target_can1[i], 0.0f, SLV_KP, SLV_KD);
+        float target = goal_target_can1[i];
+        if (is_calibrated) {
+          float lo = zero_offset_can1[i] + JOINT_LIMIT_MIN_CAN1[i];
+          float hi = zero_offset_can1[i] + JOINT_LIMIT_MAX_CAN1[i];
+          if (target < lo || target > hi) {
+            static uint32_t lastJointLimitWarnMs[NUM_MOTORS_CAN1] = {0};
+            if (millis() - lastJointLimitWarnMs[i] > 200) {
+              lastJointLimitWarnMs[i] = millis();
+              Serial.printf("[CAN1 JOINT LIMIT] Motor %d target %.3f rad clamped to [%.3f, %.3f]\r\n",
+                            SLV_IDS_CAN1[i], target, lo, hi);
+            }
+            target = target < lo ? lo : hi;
+          }
+        }
+        operationControlCan1(SLV_IDS_CAN1[i], 0.0f, target, 0.0f, SLV_KP, SLV_KD);
       } else {
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
       }
@@ -479,7 +560,21 @@ void loop() {
     // --- CAN2 제어 ---
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
       if (goal_mode_enabled) {
-        operationControlCan2(SLV_IDS_CAN2[i], 0.0f, goal_target_can2[i], 0.0f, SLV_KP, SLV_KD);
+        float target = goal_target_can2[i];
+        if (is_calibrated) {
+          float lo = zero_offset_can2[i] + JOINT_LIMIT_MIN_CAN2[i];
+          float hi = zero_offset_can2[i] + JOINT_LIMIT_MAX_CAN2[i];
+          if (target < lo || target > hi) {
+            static uint32_t lastJointLimitWarnMs[NUM_MOTORS_CAN2] = {0};
+            if (millis() - lastJointLimitWarnMs[i] > 200) {
+              lastJointLimitWarnMs[i] = millis();
+              Serial.printf("[CAN2 JOINT LIMIT] Motor %d target %.3f rad clamped to [%.3f, %.3f]\r\n",
+                            SLV_IDS_CAN2[i], target, lo, hi);
+            }
+            target = target < lo ? lo : hi;
+          }
+        }
+        operationControlCan2(SLV_IDS_CAN2[i], 0.0f, target, 0.0f, SLV_KP, SLV_KD);
       } else {
         operationControlCan2(SLV_IDS_CAN2[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
       }
@@ -491,14 +586,17 @@ void loop() {
       lastPrint = millis();
 
       const char* mode_str = goal_mode_enabled ? "GOAL" : "DISABLED";
+      const char* calib_str = is_calibrated ? "CALIB_OK" : "NO_CALIB";
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-        Serial.printf("[CAN1] Slave %d Pos: %.3f rad | Target: %.3f rad (%s) | Trq: %.2f Nm\r\n",
-                      SLV_IDS_CAN1[i], slave_pos_can1[i], goal_target_can1[i], mode_str, slave_trq_can1[i]);
+        Serial.printf("[CAN1] Slave %d Pos: %.3f rad | Target: %.3f rad (%s / %s) | Trq: %.2f Nm\r\n",
+                      SLV_IDS_CAN1[i], slave_pos_can1[i], goal_target_can1[i], mode_str, calib_str,
+                      slave_trq_can1[i]);
       }
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-        Serial.printf("[CAN2] Slave %d Pos: %.3f rad | Target: %.3f rad (%s) | Trq: %.2f Nm\r\n",
-                      SLV_IDS_CAN2[i], slave_pos_can2[i], goal_target_can2[i], mode_str, slave_trq_can2[i]);
+        Serial.printf("[CAN2] Slave %d Pos: %.3f rad | Target: %.3f rad (%s / %s) | Trq: %.2f Nm\r\n",
+                      SLV_IDS_CAN2[i], slave_pos_can2[i], goal_target_can2[i], mode_str, calib_str,
+                      slave_trq_can2[i]);
       }
 
       if (goal_mode_enabled) {
@@ -530,8 +628,12 @@ void serialEvent() {
     char ch = Serial.read();
 
     if (!receiving_goal_line) {
-      if (ch == 'd' || ch == 'D') {
+      if (ch == 'c' || ch == 'C') {
+        calibrateZero();
+      }
+      else if (ch == 'd' || ch == 'D') {
         goal_mode_enabled = false;
+        is_calibrated = false; // full stop invalidates the zero reference -- re-'c' before trusting it again
 
         for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
           disableMotorCan1(SLV_IDS_CAN1[i]); delay(20);
@@ -540,7 +642,7 @@ void serialEvent() {
           disableMotorCan2(SLV_IDS_CAN2[i]); delay(20);
         }
 
-        Serial.println("[Teensy] Motors Disabled. Send 'g' to run again.");
+        Serial.println("[Teensy] Motors Disabled. Send 'c' to re-calibrate, then 'g' to run again.");
       }
       else if (ch == 'g' || ch == 'G') {
         receiving_goal_line = true;
