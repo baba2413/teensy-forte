@@ -618,8 +618,8 @@ void loop() {
 // 11. 시리얼 명령 수신 인터럽트
 //
 // 'd'는 단일 문자 명령. 'g'는 그 뒤로 같은 줄에 4개의 float를 받을 수도 있는(또는 아무것도
-// 없이 개행만 올 수도 있는) 라인형 명령이라, 'g'를 본 순간부터 '\n'을 볼 때까지 별도 버퍼에
-// 누적한다. serialEvent()는 loop() 1회당 1번만 호출되는 Arduino 코어 콜백이므로, 그 안에서
+// 없이 개행만 올 수도 있는) 라인형 명령이라, 'g'를 본 순간부터 '\n' 또는 '\r'을 볼 때까지
+// 별도 버퍼에 누적한다. serialEvent()는 loop() 1회당 1번만 호출되는 Arduino 코어 콜백이므로, 그 안에서
 // 그 시점에 도착해 있는 바이트를 전부 소진해야 (1 tick당 1바이트만 읽으면) 멀티바이트 라인의
 // 수신 지연이 커진다.
 // -------------------------------------------------------------
@@ -656,8 +656,13 @@ void serialEvent() {
       }
       // 그 외 문자(공백, 개행 등)는 명령 시작 문자가 아니므로 무시.
     } else {
-      // 'g' 라인 누적 중
-      if (ch == '\n') {
+      // 'g' 라인 누적 중. '\n'과 '\r' 둘 다 라인 종료로 취급한다 -- screen 등 일부 시리얼
+      // 터미널은 Enter에 '\r'만 보내고 '\n'은 절대 안 보내므로, '\r'을 종료자로 인정하지
+      // 않으면 receiving_goal_line이 영영 true로 남아 이후 모든 입력(예: 'c', 'd')이
+      // 커맨드로 처리되지 못하고 조용히 라인 버퍼에 먹혀버린다 (사용자가 직접 겪은 버그).
+      // 진짜 CRLF("\r\n")가 오면 '\r'에서 라인이 끝나고, 뒤따라온 '\n'은
+      // !receiving_goal_line 상태에서 c/d/g 어느 것과도 안 맞아 그냥 무시된다 -- 중복 처리 없음.
+      if (ch == '\n' || ch == '\r') {
         goal_line_buf[goal_line_len] = '\0';
         if (goal_line_overflowed) {
           Serial.println("[Teensy] GOAL line REJECTED (too long, buffer overflow).");
@@ -667,13 +672,11 @@ void serialEvent() {
         receiving_goal_line = false;
         goal_line_overflowed = false;
         goal_line_len = 0;
-      } else if (ch == '\r') {
-        // CR은 무시 (CRLF 라인 종료 지원)
       } else if (!goal_line_overflowed) {
         if (goal_line_len < GOAL_LINE_BUF_SIZE - 1) {
           goal_line_buf[goal_line_len++] = ch;
         } else {
-          goal_line_overflowed = true; // 다음 '\n'까지 나머지는 버림 (resync)
+          goal_line_overflowed = true; // 다음 '\n' 또는 '\r'까지 나머지는 버림 (resync)
         }
       }
     }
