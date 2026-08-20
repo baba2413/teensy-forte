@@ -14,9 +14,11 @@
 // Serial protocol (single-char command, 'g' takes a payload line):
 //   g\n                        -> enter GOAL mode, holding the arm's current position
 //   g <p0> <p1> <p2> <p3>\n    -> enter/refresh GOAL mode, set the 4 joint targets
-//                                 (raw motor radians, order = SLV_IDS_CAN1[0,1], SLV_IDS_CAN2[0,1]
-//                                 = motor ids 11,12,13,14 = config.py's JOINTS order:
-//                                 shoulder_yaw, shoulder_roll, shoulder_pitch, elbow_pitch)
+//                                 (raw motor radians, order = shoulder_yaw, shoulder_pitch,
+//                                 shoulder_roll, elbow_pitch = motor ids 11, 13, 12, 14 --
+//                                 note 12/13 are swapped relative to CAN wiring order, since
+//                                 the kinematic joint order is yaw->pitch->roll->elbow, not the
+//                                 order the CAN ids happen to be wired in)
 //   d                          -> disable (zero-torque, stop)
 // -------------------------------------------------------------
 
@@ -77,9 +79,10 @@ volatile float slave_trq_can1[NUM_MOTORS_CAN1] = {};
 volatile float slave_pos_can2[NUM_MOTORS_CAN2] = {};
 volatile float slave_trq_can2[NUM_MOTORS_CAN2] = {};
 
-// GOAL 모드에서 추종할 목표 원시 라디안. 인덱스는 SLV_IDS_CAN1/CAN2와 동일한 순서
-// (11,12,13,14 = shoulder_yaw, shoulder_roll, shoulder_pitch, elbow_pitch,
-// config.py의 JOINTS 순서와 그대로 일치).
+// GOAL 모드에서 추종할 목표 원시 라디안. 인덱스는 SLV_IDS_CAN1/CAN2 배열과 동일한 순서
+// (CAN 배선 기준: goal_target_can1[0]=11, [1]=12, goal_target_can2[0]=13, [1]=14).
+// 주의: 이건 CAN 배선 순서이지 'g' 라인의 페이로드 순서(yaw,pitch,roll,elbow)와 다르다 --
+// handleGoalLine()이 그 사이를 매핑한다.
 float goal_target_can1[NUM_MOTORS_CAN1] = {};
 float goal_target_can2[NUM_MOTORS_CAN2] = {};
 uint32_t last_goal_rx_time = 0; // 마지막으로 유효한 'g' 라인을 받은 시각 (GOAL_TIMEOUT_MS 왓치독용)
@@ -348,8 +351,8 @@ void enterGoalModeIfNeeded() {
   }
 
   goal_mode_enabled = true;
-  Serial.println("[Teensy] GOAL mode ENABLED. Send 'g <p0> <p1> <p2> <p3>' (raw rad) to move. "
-                  "Send 'd' to stop.");
+  Serial.println("[Teensy] GOAL mode ENABLED. Send 'g <yaw> <pitch> <roll> <elbow>' (raw rad) "
+                  "to move. Send 'd' to stop.");
 }
 
 // line은 NUL로 끝나는 문자열, len은 '\n'/'\r' 제외한 실제 길이 (0 가능 -- bare "g\n").
@@ -376,9 +379,11 @@ void handleGoalLine(const char* line, uint8_t len) {
     return;
   }
 
+  // Payload order is kinematic (yaw, pitch, roll, elbow), not CAN-wiring order --
+  // motors 12 (roll) and 13 (pitch) are swapped relative to their CAN bus grouping.
   goal_target_can1[0] = v0; // 11 shoulder_yaw
-  goal_target_can1[1] = v1; // 12 shoulder_roll
-  goal_target_can2[0] = v2; // 13 shoulder_pitch
+  goal_target_can2[0] = v1; // 13 shoulder_pitch
+  goal_target_can1[1] = v2; // 12 shoulder_roll
   goal_target_can2[1] = v3; // 14 elbow_pitch
 
   enterGoalModeIfNeeded();
