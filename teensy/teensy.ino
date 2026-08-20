@@ -53,11 +53,16 @@ const uint8_t GOAL_LINE_BUF_SIZE = 64; // 'g' 명령 한 줄의 최대 길이
 // [영점 + MIN, 영점 + MAX] 범위로 클램프된다.
 //
 // TODO: 아래 값은 PLACEHOLDER (영점 기준 +-1.0 rad)다. 실제 팔의 물리적으로 검증된 안전
-// 가동 범위로 반드시 교체할 것 -- 지금 값으로는 실제 안전한계로 신뢰하면 안 된다.
-const float JOINT_LIMIT_MIN_CAN1[NUM_MOTORS_CAN1] = {-1.0f, -1.0f};
-const float JOINT_LIMIT_MAX_CAN1[NUM_MOTORS_CAN1] = { 1.0f,  1.0f};
-const float JOINT_LIMIT_MIN_CAN2[NUM_MOTORS_CAN2] = {-1.0f, -1.0f};
-const float JOINT_LIMIT_MAX_CAN2[NUM_MOTORS_CAN2] = { 1.0f,  1.0f};
+// J1 (Yaw)   : [-2.2086 rad, +2.2086 rad] (기존 2.4086에서 0.2 감소)
+// J2 (Roll)  : [-2.2800 rad, +2.2800 rad] (기존 2.4800에서 0.2 감소)
+// J3 (Pitch) : [-2.3000 rad, +0.1000 rad] (음수 동작, 한계 0.2 감소 및 초기점 +0.1 여유)
+// J4 (Pitch) : [-0.1000 rad, +0.9500 rad] (양수 동작, 한계 0.2 감소 및 초기점 -0.1 여유)
+const float JOINT_LIMIT_MIN_CAN1[NUM_MOTORS_CAN1] = {-2.2086f, -2.2800f}; 
+const float JOINT_LIMIT_MAX_CAN1[NUM_MOTORS_CAN1] = { 2.2086f,  2.2800f};
+
+const float JOINT_LIMIT_MIN_CAN2[NUM_MOTORS_CAN2] = {-2.3000f, -0.1000f}; 
+const float JOINT_LIMIT_MAX_CAN2[NUM_MOTORS_CAN2] = { 0.1000f,  0.9500f};
+
 
 // Teensy 4.0/4.1 CAN1, CAN2 사용 (모터 11,12는 CAN1 / 13,14는 CAN2 배선)
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
