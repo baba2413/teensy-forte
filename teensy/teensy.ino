@@ -49,8 +49,8 @@ const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2] = {13, 14}; // shoulder_pitch, elbow
 const uint8_t HOST_ID = 253;
 
 // 위치 추종 게인 (teleop-bi-p-t의 SLV_KP/KD와 동일한 값으로 시작)
-const float SLV_KP = 24.0f;
-const float SLV_KD = 0.2f;
+const float SLV_KP = 10.0f;
+const float SLV_KD = 0.1f;
 
 // GOAL 모드 설정. isaacsim-udp의 WATCHDOG_TIMEOUT_MS와 동일한 500ms -- 유선 시리얼 바이트
 // 스트림보다 UDP 쪽이 패킷 유실 특성이 다르므로, 이전 시리얼 버전의 150ms보다 여유를 둔다.
