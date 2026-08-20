@@ -27,28 +27,26 @@ const uint8_t JOINT_CAN_IDS[NUM_JOINTS] = {11, 13, 12, 14};
 const float GEAR_RATIO[NUM_JOINTS] = {4.8077f, 3.180f, 1.0f, 1.0f};
 
 // -------------------------------------------------------------
-// 3. 캘리브레이션 (링크 좌표계 기준 sign / offset)
-//    offset은 매 'e'(enable) 시점에 computeCalibOffsets()가 자동으로 재계산해
-//    덮어쓰므로 여기서는 0.0f로만 초기화해두면 된다 (영구 저장 불필요).
-//    sign은 자동 계산 대상이 아니므로, 실제 회전 방향이 반대인 조인트가
-//    있으면 여기서 직접 -1.0f로 바꿔야 한다.
+// 3. 조인트 회전 방향 (링크 좌표계 기준). 실제 회전 방향이 반대인 조인트가
+//    있으면 여기서 직접 -1.0f로 바꿔야 한다 (자동 계산 대상 아님).
+//
+//    절대 위치 오프셋(구 calib[].offset / computeCalibOffsets())은 더 이상
+//    쓰지 않는다. 대신 'e'(enable) 시점에 baseline을 스냅샷해서, 그 이후
+//    UDP 목표값의 "변화량(delta)"만 현재 모터 위치에 더해 추종한다
+//    (captureBaseline() 참고). sim이 enable 순간 절대적으로 어떤 위치에
+//    있었든 첫 명령의 delta는 항상 0이라 튀어나갈 여지가 없다.
 // -------------------------------------------------------------
-struct JointCalibration {
-  float sign;
-  float offset;
-};
-
-JointCalibration calib[NUM_JOINTS] = {
-  {1.0f, 0.0f}, // Joint 0 (shoulder_yaw,   CAN 1)
-  {1.0f, 0.0f}, // Joint 1 (shoulder_pitch, CAN 3)
-  {1.0f, 0.0f}, // Joint 2 (shoulder_roll,  CAN 2)
-  {1.0f, 0.0f}, // Joint 3 (elbow_pitch,    CAN 4)
+const float JOINT_SIGN[NUM_JOINTS] = {
+  1.0f, // Joint 0 (shoulder_yaw,   CAN 11)
+  1.0f, // Joint 1 (shoulder_pitch, CAN 13)
+  1.0f, // Joint 2 (shoulder_roll,  CAN 12)
+  1.0f, // Joint 3 (elbow_pitch,    CAN 14)
 };
 
 const char* JOINT_NAMES[NUM_JOINTS] = {"shoulder_yaw", "shoulder_pitch", "shoulder_roll", "elbow_pitch"};
 
 // multiple_ik_udp.py MyCustomSceneCfg.robot.init_state.joint_pos 값 (링크 좌표계, rad)
-// computeCalibOffsets()에서 "실물을 이 자세로 맞춘 뒤 오프셋을 역산"하는 기준값으로 사용됨.
+// 지금은 UDP 입력 안전 클램프(TEST_LINK_RANGE_LIMIT)의 중심값으로만 쓰인다.
 const float SIM_DEFAULT_LINK_POS[NUM_JOINTS] = {0.0f, -1.0472f, 0.0f, 2.0944f};
 
 // -------------------------------------------------------------
@@ -94,11 +92,18 @@ uint32_t last_packet_time = 0;
 const uint32_t WATCHDOG_TIMEOUT_MS = 500; // 0.5초간 패킷 미수신 시 안전 정지
 
 // -------------------------------------------------------------
-// 6b. 오프셋 1회 자동 계산용 모터 피드백 버퍼
-//     사용법: 로봇팔을 손으로 SIM_DEFAULT_LINK_POS 자세와 맞춘 뒤 'e'를 누르면,
-//     enable 직후 computeCalibOffsets()가 한 번만 실행되어 각 모터의 raw 위치를
-//     읽고 calib[].offset을 즉시 계산/반영한다 (teensy-forte teleop-bi의
-//     setupOffset() 패턴과 동일: 지속 폴링이 아니라 enable 시점 1회성 스냅샷).
+// 6a. Enable 시점 baseline (delta 추종 방식의 핵심)
+//     'e' 누르는 순간의 실측 모터 위치 + 그 순간의 UDP 목표값을 스냅샷해둔다.
+//     이후 매 tick마다 "UDP 목표값이 baseline 대비 얼마나 변했는가(delta)"만
+//     구해서 baseline 모터 위치에 더한다. sim이 enable 순간 어떤 절대 위치에
+//     있었든 첫 명령의 delta는 항상 0이므로, enable 순간 절대 튀어나가지 않는다.
+// -------------------------------------------------------------
+float baseline_motor_pos[NUM_JOINTS] = {0.0f};   // 'e' 시점 fb[i].pos 스냅샷
+float baseline_link_target[NUM_JOINTS] = {0.0f}; // 'e' 시점 ext_target_pos 스냅샷
+bool baseline_ready = false;
+
+// -------------------------------------------------------------
+// 6b. 모터 피드백 버퍼 (항상 최신 유지, idle 중에도 무저항 프로브로 계속 갱신됨)
 // -------------------------------------------------------------
 struct MotorFeedback {
   float pos;
@@ -164,6 +169,7 @@ bool plotStreamEnabled = false;
 float last_cmd_link_pos[NUM_JOINTS] = {0.0f};
 float last_cmd_motor_pos[NUM_JOINTS] = {0.0f};
 float last_cmd_ff_torque[NUM_JOINTS] = {0.0f};
+float last_cmd_delta_link[NUM_JOINTS] = {0.0f};
 
 // TEST_LINK_RANGE_LIMIT 클램프 / RAW_LIMIT 드롭 발생 횟수. 매 패킷마다 로그를 찍으면
 // Isaac Sim의 큰 동작 폭 때문에 시리얼이 도배되므로, LOG_PERIOD_MS 요약에만 합쳐서 출력한다.
@@ -318,26 +324,26 @@ void operationControl(uint8_t motor_id, float feed_forward, float pos, float vel
   }
 }
 
-// 'c' 명령으로 호출 (enable('e')과 분리됨, enable 여부와 무관하게 언제든 실행 가능):
-// 로봇팔을 손으로 SIM_DEFAULT_LINK_POS 자세에 맞춘 뒤 누르면, loop()가 상시 갱신 중인
-// 현재 모터 피드백을 그대로 읽어 SIM_DEFAULT_LINK_POS와 비교, calib[].offset을 계산해
-// 즉시 반영한다. loop()가 idle 상태에서도 무저항 프로브로 fb[]를 계속 갱신해두므로
-// 여기서 별도로 프로브를 보내고 기다릴 필요가 없다.
-void computeCalibOffsets() {
-  Serial.println("--- [CALIB] Offset snapshot (motor pos vs sim default pose) ---");
+// 'e'(enable) 처리 중 호출: 그 순간의 실측 모터 위치와 그 순간의 UDP 목표값을
+// baseline으로 스냅샷한다. fb[]/ext_target_pos는 idle 중에도 항상 최신으로 유지되고
+// 있으므로(무저항 프로브 / UDP 파싱이 계속 돌아감) 별도로 기다릴 필요가 없다.
+// 이후 제어는 baseline 대비 UDP 목표값의 "변화량(delta)"만 현재 모터 위치에 더하므로,
+// 이 시점에 sim이 어떤 절대 자세에 있었든 최초 명령은 항상 delta=0 -> 절대 안 튄다.
+void captureBaseline() {
+  Serial.println("--- [BASELINE] Captured at enable ---");
   for (int i = 0; i < NUM_JOINTS; i++) {
+    baseline_motor_pos[i] = fb[i].pos;
+    baseline_link_target[i] = ext_target_pos[i];
     if (!fb[i].updated) {
-      Serial.printf("  Joint %d %-14s (CAN %2d): FAILED - no feedback received yet\r\n",
+      Serial.printf("  Joint %d %-14s (CAN %2d): WARNING - no motor feedback received yet, baseline motor pos=0\r\n",
                     i, JOINT_NAMES[i], JOINT_CAN_IDS[i]);
-      continue;
+    } else {
+      Serial.printf("  Joint %d %-14s (CAN %2d) motor_baseline=%7.4f rad  link_baseline=%7.4f rad\r\n",
+                    i, JOINT_NAMES[i], JOINT_CAN_IDS[i], baseline_motor_pos[i], baseline_link_target[i]);
     }
-    float link_pos_measured = fb[i].pos / GEAR_RATIO[i]; // 모터축 -> 링크 좌표계
-    float offset = link_pos_measured - SIM_DEFAULT_LINK_POS[i];
-    calib[i].offset = offset; // 즉시 반영 (재부팅마다 이 함수로 다시 계산하는 방식이라 영구 저장은 하지 않음)
-    Serial.printf("  Joint %d %-14s (CAN %2d) raw=%7.3f rad -> link=%7.3f rad (sim default=%.3f) => offset=%.4f rad [applied]\r\n",
-                  i, JOINT_NAMES[i], JOINT_CAN_IDS[i], fb[i].pos, link_pos_measured, SIM_DEFAULT_LINK_POS[i], offset);
   }
-  Serial.println("[CALIB] Applied to calib[] for this session.");
+  baseline_ready = true;
+  Serial.println("[BASELINE] motor_pos = motor_baseline + (udp_target - link_baseline) * sign * gear_ratio");
 }
 
 // -------------------------------------------------------------
@@ -545,11 +551,11 @@ void logStatus() {
 
     Serial.printf("  2. Target position from UDP (link axis)  : %8.4f rad  (clamped %lu time(s) this period, raw request=%.4f)\r\n",
                   ext_target_pos[i], (unsigned long)range_clamp_count[i], last_udp_target_raw[i]);
-    Serial.printf("  3. This motor's calibration offset       : %+.4f rad  (sign=%+.1f)\r\n",
-                  calib[i].offset, calib[i].sign);
-    Serial.printf("  4. This motor's gear ratio                : x%.4f\r\n",
-                  GEAR_RATIO[i]);
-    Serial.printf("  5. Final position (offset+gear applied)  : %8.4f rad (motor axis)   <- computed, full precision\r\n",
+    Serial.printf("  3. Baseline @ last enable  motor=%8.4f rad  link=%8.4f rad  (sign=%+.1f)\r\n",
+                  baseline_motor_pos[i], baseline_link_target[i], JOINT_SIGN[i]);
+    Serial.printf("  4. Delta from baseline (link axis, gear=x%.4f) : %8.4f rad\r\n",
+                  GEAR_RATIO[i], last_cmd_delta_link[i]);
+    Serial.printf("  5. Final position (baseline+delta*gear)  : %8.4f rad (motor axis)   <- computed, full precision\r\n",
                   last_cmd_motor_pos[i]);
 
     if (last_can_sent[i]) {
@@ -596,10 +602,9 @@ void setup() {
                 enable_debug ? "ON" : "OFF",
                 (unsigned long)(enable_debug ? DEBUG_LOG_PERIOD_MS : NORMAL_LOG_PERIOD_MS));
   Serial.println("Serial commands : d=disable");
-  Serial.println("                  e=enable all motors (does NOT calibrate)");
-  Serial.println("                  c=pose arm to sim default pose by hand, THEN press c");
-  Serial.println("                    -> computes/applies calib[] offsets from current motor feedback");
-  Serial.println("                       (works enabled or disabled; feedback is always kept live)");
+  Serial.println("                  e=enable all motors + capture baseline (current motor pos + current");
+  Serial.println("                    UDP target). From then on, motor follows ONLY the delta of the UDP");
+  Serial.println("                    target from that baseline -> no jump at enable, regardless of sim pose.");
   Serial.println("                  p=pause/resume periodic status log");
   Serial.println("                  g=toggle real-time PLOT,... CSV stream (for plot_positions.py)");
   Serial.println("                  f=attempt fault reset on all motors (stop->re-enable->stop)");
@@ -676,39 +681,49 @@ void loop() {
     // 응답을 받을 때만 true로 세팅하고, 그 이후 계속 true로 유지되는 것으로 충분하다.
     if (ext_control_active && (millis() - last_packet_time < WATCHDOG_TIMEOUT_MS)) {
 
-      float target_vel = 0.0f;
-      float kp = 15.0f;
-      float kd = 1.0f;
+      if (!baseline_ready) {
+        // 'e'를 아직 안 눌러 baseline이 없는 상태 -> 무저항 프로브만 유지 (움직이지 않음)
+        for (int i = 0; i < NUM_JOINTS; i++) {
+          operationControl(JOINT_CAN_IDS[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+      } else {
+        float target_vel = 0.0f;
+        float kp = 15.0f;
+        float kd = 1.0f;
 
-      // 1. 링크 좌표계에서 sign/offset 캘리브레이션 적용 (4관절 전체 먼저 계산)
-      float link_pos[NUM_JOINTS];
-      for (int i = 0; i < NUM_JOINTS; i++) {
-        link_pos[i] = (ext_target_pos[i] * calib[i].sign) + calib[i].offset;
-      }
+        // 1. baseline 대비 UDP 목표값의 변화량(delta, 링크축)만 계산 - 절대 위치는 안 씀
+        float delta_link[NUM_JOINTS];
+        float link_pos_est[NUM_JOINTS]; // sim 자체 관점의 절대 각도 추정치 (중력보상 참고용)
+        for (int i = 0; i < NUM_JOINTS; i++) {
+          delta_link[i] = (ext_target_pos[i] - baseline_link_target[i]) * JOINT_SIGN[i];
+          link_pos_est[i] = ext_target_pos[i] * JOINT_SIGN[i];
+        }
 
-      // 2. 현재 목표 자세 기준 중력 보상 토크 계산 (링크축, Nm)
-      float tau_gravity_link[NUM_JOINTS];
-      computeGravityTorques(link_pos[0], link_pos[1], link_pos[2], link_pos[3], tau_gravity_link);
+        // 2. 현재 목표 자세 기준 중력 보상 토크 계산 (링크축, Nm)
+        float tau_gravity_link[NUM_JOINTS];
+        computeGravityTorques(link_pos_est[0], link_pos_est[1], link_pos_est[2], link_pos_est[3], tau_gravity_link);
 
-      for (int i = 0; i < NUM_JOINTS; i++) {
-        // 3. 모터:링크 회전비를 곱해 모터축(=CAN 명령) 좌표계로 변환
-        float motor_pos = link_pos[i] * GEAR_RATIO[i];
-        // 토크는 위치와 반대로 회전비로 나눔 (외부 감속단이 토크를 ratio배 증폭하므로)
-        float feed_forward_torque = GRAVITY_COMPENSATION_ENABLED ? (tau_gravity_link[i] / GEAR_RATIO[i]) : 0.0f;
+        for (int i = 0; i < NUM_JOINTS; i++) {
+          // 3. delta에 모터:링크 회전비를 곱해 모터축(=CAN 명령) 좌표계로 변환한 뒤 baseline에 더함
+          float motor_pos = baseline_motor_pos[i] + delta_link[i] * GEAR_RATIO[i];
+          // 토크는 위치와 반대로 회전비로 나눔 (외부 감속단이 토크를 ratio배 증폭하므로)
+          float feed_forward_torque = GRAVITY_COMPENSATION_ENABLED ? (tau_gravity_link[i] / GEAR_RATIO[i]) : 0.0f;
 
-        last_cmd_link_pos[i] = link_pos[i];
-        last_cmd_motor_pos[i] = motor_pos;
-        last_cmd_ff_torque[i] = feed_forward_torque;
+          last_cmd_delta_link[i] = delta_link[i];
+          last_cmd_link_pos[i] = link_pos_est[i];
+          last_cmd_motor_pos[i] = motor_pos;
+          last_cmd_ff_torque[i] = feed_forward_torque;
 
-        operationControl(JOINT_CAN_IDS[i], feed_forward_torque, motor_pos, target_vel, kp, kd);
-      }
+          operationControl(JOINT_CAN_IDS[i], feed_forward_torque, motor_pos, target_vel, kp, kd);
+        }
 
-      if (plotStreamEnabled) {
-        // PLOT,millis,link_yaw,link_pitch,link_roll,link_elbow,motor_yaw,motor_pitch,motor_roll,motor_elbow
-        Serial.printf("PLOT,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\r\n",
-                      (unsigned long)millis(),
-                      last_cmd_link_pos[0], last_cmd_link_pos[1], last_cmd_link_pos[2], last_cmd_link_pos[3],
-                      last_cmd_motor_pos[0], last_cmd_motor_pos[1], last_cmd_motor_pos[2], last_cmd_motor_pos[3]);
+        if (plotStreamEnabled) {
+          // PLOT,millis,link_yaw,link_pitch,link_roll,link_elbow,motor_yaw,motor_pitch,motor_roll,motor_elbow
+          Serial.printf("PLOT,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\r\n",
+                        (unsigned long)millis(),
+                        last_cmd_link_pos[0], last_cmd_link_pos[1], last_cmd_link_pos[2], last_cmd_link_pos[3],
+                        last_cmd_motor_pos[0], last_cmd_motor_pos[1], last_cmd_motor_pos[2], last_cmd_motor_pos[3]);
+        }
       }
 
     } else {
@@ -716,6 +731,7 @@ void loop() {
       if (ext_control_active) {
         Serial.println("[EMERGENCY] UDP Timeout! Disabling all motors.");
         ext_control_active = false;
+        baseline_ready = false; // 다음 활성 제어는 반드시 새 'e'로 baseline을 다시 잡아야 함
         for (int i = 0; i < NUM_JOINTS; i++) {
           disableMotor(JOINT_CAN_IDS[i]);
         }
@@ -736,10 +752,9 @@ void loop() {
 }
 
 // 시리얼 명령 수동 제어
-// E: 전체 모터 enable (MIT run mode). 캘리브레이션은 하지 않음 (C로 분리됨)
-// C: 로봇팔을 SIM_DEFAULT_LINK_POS 자세로 손으로 맞춘 뒤 누르면 calib[].offset 계산/적용
-//    (enable 여부와 무관하게 언제든 실행 가능 - 모터 피드백은 항상 최신으로 유지되고 있음)
-// D: 전체 끄기
+// E: 전체 모터 enable (MIT run mode) + baseline 캡처(현재 모터 위치 + 현재 UDP 목표값).
+//    이후 제어는 이 baseline 대비 UDP 목표값의 변화량(delta)만 추종한다.
+// D: 전체 끄기 (다음 enable 전까지 baseline 무효화)
 // P: 주기 상태 로그(logStatus) 출력 일시정지/재개 토글 (모터 제어/UDP 수신에는 영향 없음)
 // G: 실시간 위치 CSV(PLOT,...) 스트림 토글 (plot_positions.py가 이 출력을 파싱함)
 // F: 전체 모터 fault 초기화 시도 (정지->Run Mode 재기록->enable->정지, 이후 다시 e로 enable 필요)
@@ -747,6 +762,7 @@ void serialEvent() {
   if (Serial.available()) {
     char ch = Serial.read();
     if (ch == 'd' || ch == 'D') {
+      baseline_ready = false;
       for (int i = 0; i < NUM_JOINTS; i++) {
         disableMotor(JOINT_CAN_IDS[i]);
       }
@@ -756,13 +772,12 @@ void serialEvent() {
         enableMotor(JOINT_CAN_IDS[i]);
         delay(20); // CAN 버스 연속 명령 안정성을 위한 미세 딜레이
       }
+      captureBaseline(); // 이 순간의 모터 위치 + UDP 목표값을 baseline으로 스냅샷
       LOG_PERIOD_MS = enable_debug ? DEBUG_LOG_PERIOD_MS : NORMAL_LOG_PERIOD_MS;
       if (enable_debug) {
         Serial.printf("[Teensy] enable_debug=true -> LOG_PERIOD_MS=%lums (dense logging). Press 'p' to pause and inspect.\r\n",
                       (unsigned long)LOG_PERIOD_MS);
       }
-    } else if (ch == 'c' || ch == 'C') {
-      computeCalibOffsets();
     } else if (ch == 'p' || ch == 'P') {
       serialLogPaused = !serialLogPaused;
       Serial.printf("[Teensy] Status log %s.\r\n", serialLogPaused ? "PAUSED" : "RESUMED");
@@ -771,6 +786,7 @@ void serialEvent() {
       Serial.printf("[Teensy] Plot CSV stream %s.\r\n", plotStreamEnabled ? "ON" : "OFF");
     } else if (ch == 'f' || ch == 'F') {
       ext_control_active = false; // fault 초기화 후에는 재enable('e') 전까지 UDP 제어 재개하지 않음
+      baseline_ready = false; // 재enable 전까지 baseline도 무효화
       for (int i = 0; i < NUM_JOINTS; i++) {
         clearFault(JOINT_CAN_IDS[i]); // 정지 -> Run Mode 재기록 -> enable (재기동으로 fault 재평가 유도)
         delay(20);
