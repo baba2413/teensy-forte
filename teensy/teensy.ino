@@ -2,10 +2,10 @@
 #include <FlexCAN_T4.h>
 
 // -------------------------------------------------------------
-// 여러 모터 동시 확인용 테스트 코드
-// - 'e' : 모든 모터 enable + 각자의 현재 위치 읽기 -> 그 위치부터 천천히
-//         음의 방향으로 동일한 명령(작은 회전)을 동시에 송신 시작
-// - 'd' : 모든 모터 disable + 회전 정지
+// Test code for checking multiple motors simultaneously
+// - 'e' : enable all motors + read each one's current position -> starting from that position,
+//         start sending the same command (a small rotation) slowly in the negative direction to all at once
+// - 'd' : disable all motors + stop rotation
 // -------------------------------------------------------------
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
@@ -14,20 +14,20 @@ const uint8_t MOTOR_IDS[] = {11, 13};
 const uint8_t NUM_MOTORS = sizeof(MOTOR_IDS) / sizeof(MOTOR_IDS[0]);
 const uint8_t HOST_ID = 253;
 
-// Robstride 프로토콜 물리적 한계값 (MIT 모드 패킹용)
+// Robstride protocol physical limit values (for MIT mode packing)
 const float P_MIN = -12.5f;   const float P_MAX = 12.5f;
 const float V_MIN = -45.0f;   const float V_MAX = 45.0f;
 const float KP_MAX = 500.0f;  const float KD_MAX = 5.0f;
 const float T_MIN = -18.0f;   const float T_MAX = 18.0f;
 
-// 제어 게인 (확인용이므로 약하게)
+// Control gains (kept weak since this is just for checking)
 const float KP = 10.0f;
 const float KD = 1.0f;
 
-// 천천히 음의 방향으로 회전하는 속도 (raw 위치 단위, rad/s)
+// Speed for slowly rotating in the negative direction (raw position units, rad/s)
 const float ROTATE_SPEED = 0.05f;
 
-// 시작 위치 기준 안전 이동 범위 (raw 위치 단위, rad). 이 이상은 더 가지 않고 멈춘다.
+// Safe travel range relative to the start position (raw position units, rad). Stops rather than going further than this.
 const float ROTATE_RANGE_LIMIT = 3.0f;
 
 const uint32_t CONTROL_PERIOD_US = 20000; // 50Hz
@@ -49,18 +49,18 @@ float start_pos[NUM_MOTORS];
 float target_pos[NUM_MOTORS];
 
 // -------------------------------------------------------------
-// 진단용 상태 (회전 안 하는 원인 분석용, 모터별)
+// Diagnostic state (per-motor, for analyzing why rotation isn't happening)
 // -------------------------------------------------------------
-volatile uint32_t rx_total_count = 0;                    // 수신된 모든 CAN 프레임 수 (mode/ID 무관)
-volatile uint32_t rx_mode2_count = 0;                     // mode==2(피드백) 프레임 수 (ID 무관)
-volatile uint32_t rx_matched_count[NUM_MOTORS] = {0};      // mode==2 이면서 해당 motor_id인 프레임 수
-volatile uint32_t last_rx_id = 0;                          // 가장 최근 수신된 프레임의 raw CAN ID (mode/ID 무관)
-volatile uint32_t last_rx_ms = 0;                          // 가장 최근 수신 시각
+volatile uint32_t rx_total_count = 0;                    // Count of all CAN frames received (regardless of mode/ID)
+volatile uint32_t rx_mode2_count = 0;                     // Count of mode==2 (feedback) frames (regardless of ID)
+volatile uint32_t rx_matched_count[NUM_MOTORS] = {0};      // Count of frames that are mode==2 and match this motor_id
+volatile uint32_t last_rx_id = 0;                          // Raw CAN ID of the most recently received frame (regardless of mode/ID)
+volatile uint32_t last_rx_ms = 0;                          // Timestamp of the most recent receive
 
-volatile uint8_t fault_bits[NUM_MOTORS] = {0};             // Type2 피드백의 fault 비트 (bits 21-16, 6bit)
-volatile uint8_t motor_run_mode[NUM_MOTORS] = {0};         // Type2 피드백의 모터 상태 (bits 23-22): 0=Reset,1=Cali,2=Run
+volatile uint8_t fault_bits[NUM_MOTORS] = {0};             // Fault bits from Type2 feedback (bits 21-16, 6 bits)
+volatile uint8_t motor_run_mode[NUM_MOTORS] = {0};         // Motor state from Type2 feedback (bits 23-22): 0=Reset,1=Cali,2=Run
 
-uint32_t tx_control_count = 0;             // operationControl() 호출(=CAN TX 시도) 횟수
+uint32_t tx_control_count = 0;             // Number of operationControl() calls (=CAN TX attempts)
 uint32_t last_can_id_tx = 0;
 uint8_t last_can_buf_tx[8] = {0};
 
@@ -97,7 +97,7 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
 }
 
 void rxCallback(const CAN_message_t &msg) {
-  // 진단용: mode/ID와 무관하게 CAN 버스에 뭔가 들어오고 있는지부터 확인
+  // For diagnostics: first confirm whether anything at all is coming in on the CAN bus, regardless of mode/ID
   rx_total_count++;
   last_rx_id = msg.id;
   last_rx_ms = millis();
@@ -107,7 +107,7 @@ void rxCallback(const CAN_message_t &msg) {
   rx_mode2_count++;
 
   uint8_t motor_id = (msg.id >> 8) & 0xFF;
-  // Robstride Type2 피드백 ID 레이아웃: bits23-22=motor_mode, bits21-16=fault, bits15-8=motor_id
+  // Robstride Type2 feedback ID layout: bits23-22=motor_mode, bits21-16=fault, bits15-8=motor_id
   uint8_t new_fault = (msg.id >> 16) & 0x3F;
   uint8_t new_run_mode = (msg.id >> 22) & 0x03;
 
@@ -134,8 +134,8 @@ void enableMotor(uint8_t motor_id) {
   mode_msg.id = (0x12 << 24) | (HOST_ID << 8) | motor_id;
   mode_msg.len = 8;
   for (int i = 0; i < 8; i++) mode_msg.buf[i] = 0;
-  mode_msg.buf[0] = 0x05; mode_msg.buf[1] = 0x70; // Run Mode 주소 (0x7005)
-  mode_msg.buf[4] = 0x00; // MIT 운전 제어 모드 (0)
+  mode_msg.buf[0] = 0x05; mode_msg.buf[1] = 0x70; // Run Mode address (0x7005)
+  mode_msg.buf[4] = 0x00; // MIT operation control mode (0)
   Can0.write(mode_msg);
   delay(50);
 
@@ -180,7 +180,7 @@ void operationControl(uint8_t motor_id, float feed_forward, float pos, float vel
   memcpy(last_can_buf_tx, msg.buf, 8);
 }
 
-// enable 직후: 모든 모터에 무저항(zero-gain) 프로브 프레임을 보내 현재 위치를 읽는다.
+// Right after enable: send a zero-resistance (zero-gain) probe frame to all motors and read their current position.
 void readAllCurrentPos() {
   for (uint8_t i = 0; i < NUM_MOTORS; i++) {
     fb[i].updated = false;
@@ -195,13 +195,13 @@ void readAllCurrentPos() {
   for (uint8_t i = 0; i < NUM_MOTORS; i++) {
     uint8_t motor_id = MOTOR_IDS[i];
     if (!fb[i].updated) {
-      Serial.printf("[WARN] Motor %d 현재 위치 피드백을 받지 못했습니다. 0으로 시작합니다.\r\n", motor_id);
-      Serial.printf("       rx_total=%lu rx_mode2=%lu rx_matched=%lu (motor_id=%d 프레임이 안 들어오면 배선/보드레이트/ID 문제)\r\n",
+      Serial.printf("[WARN] Motor %d did not receive current position feedback. Starting at 0.\r\n", motor_id);
+      Serial.printf("       rx_total=%lu rx_mode2=%lu rx_matched=%lu (if motor_id=%d frames aren't coming in, it's a wiring/baud-rate/ID problem)\r\n",
                     (unsigned long)rx_total_count, (unsigned long)rx_mode2_count,
                     (unsigned long)rx_matched_count[i], motor_id);
       start_pos[i] = 0.0f;
     } else {
-      Serial.printf("[Teensy] Motor %d 현재 위치 확인됨 = %.4f rad. run_mode=%d fault=0x%02X\r\n",
+      Serial.printf("[Teensy] Motor %d current position confirmed = %.4f rad. run_mode=%d fault=0x%02X\r\n",
                     motor_id, fb[i].pos, motor_run_mode[i], fault_bits[i]);
       printFaultBits(motor_id, fault_bits[i]);
       start_pos[i] = fb[i].pos;
@@ -222,11 +222,11 @@ void setup() {
   Can0.onReceive(rxCallback);
 
   Serial.println("==================================================");
-  Serial.printf("[Teensy] 다중 모터(%d개) 동시 확인용 코드: ", NUM_MOTORS);
+  Serial.printf("[Teensy] Code for checking %d motors simultaneously: ", NUM_MOTORS);
   for (uint8_t i = 0; i < NUM_MOTORS; i++) Serial.printf("%d ", MOTOR_IDS[i]);
   Serial.println();
-  Serial.println("e = enable (모든 모터가 각자의 현재 위치부터 동일한 명령으로 천천히 음의 방향 회전 시작)");
-  Serial.println("d = disable (모든 모터 정지)");
+  Serial.println("e = enable (all motors start rotating slowly in the negative direction with the same command, from each one's current position)");
+  Serial.println("d = disable (stop all motors)");
   Serial.println("==================================================");
 
   controlTimer = 0;
@@ -242,7 +242,7 @@ void loop() {
       delay(20);
       readAllCurrentPos();
       running = true;
-      Serial.println("[Teensy] 모든 모터가 동일한 명령으로 음의 방향 회전을 시작합니다.");
+      Serial.println("[Teensy] All motors are starting negative-direction rotation with the same command.");
     } else if (ch == 'd' || ch == 'D') {
       running = false;
       for (uint8_t i = 0; i < NUM_MOTORS; i++) disableMotor(MOTOR_IDS[i]);
