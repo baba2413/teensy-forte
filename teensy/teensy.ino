@@ -1,6 +1,31 @@
 #include <Arduino.h>
 #include <FlexCAN_T4.h>
+#include <QNEthernet.h>
 #include <math.h>
+
+using namespace qindesign::network;
+
+// -------------------------------------------------------------
+// UDP 텔레메트리 (읽기 전용, 'teleop-bi-c'에서 추가) -- 기존 Serial.printf() 상태 로그는 그대로
+// 두고, 동일한 문자열을 UDP로도 병행 전송한다. 목적은 오직 하나: 지금까지는
+// 'lerobot-record' 세션 내내 minicom을 열어두면 시리얼 포트를 파이썬(TeensyLink)과 두고
+// 다퉈야 했는데(그래서 실제로는 리셋 구간에만 열고 닫아야 했다), 텔레메트리를 UDP로 옮기면
+// 파이썬은 시리얼을 아예 건드리지 않게 되어 minicom을 녹화 시작부터 끝까지 계속 열어둘 수
+// 있다. 시리얼 명령('e'/'c'/'d')과 CAN 제어 루프는 이 커밋에서 전혀 건드리지 않았다 --
+// 오직 상태 로그 줄의 "출력 목적지"가 하나(Serial)에서 둘(Serial + UDP)로 늘었을 뿐이다.
+//
+// 하드코딩 유니캐스트(브로드캐스트 아님)로 결정: Teensy IP는 'goal' 브랜치와 동일한 물리
+// 하드웨어이므로 그 브랜치의 정적 IP(192.168.1.15)를 그대로 재사용한다. 호스트 목적지 IP는
+// RUNBOOK.md Phase 9가 이미 문서화해 둔 host static IP(192.168.1.10, 192.168.1.0/24 직결
+// 케이블 서브넷)를 그대로 재사용한다. 포트는 'goal' 브랜치가 쓰는 5005(호스트->Teensy 목표
+// 스트림)와 겹치지 않도록, 그리고 방향이 반대(Teensy->호스트 텔레메트리)임을 표시하기 위해
+// 5006으로 분리했다. 둘 다 이 파일의 상수이므로 실제 배치 IP가 다르면 여기만 고치면 된다.
+// -------------------------------------------------------------
+IPAddress teensyStaticIP(192, 168, 1, 15);
+IPAddress teensySubnetMask(255, 255, 255, 0);
+IPAddress telemetryHostIP(192, 168, 1, 10);
+const uint16_t TELEMETRY_UDP_PORT = 5006;
+EthernetUDP telemetryUdp;
 
 // -------------------------------------------------------------
 // 1. 모터 및 통신 설정 파라미터
@@ -152,6 +177,16 @@ float processSlaveTorqueSafety(float slave_trq, MasterTorqueState &state) {
 
   state.current_output_trq = target_trq;
   return target_trq;
+}
+
+// Serial.print()된 것과 완전히 동일한 문자열을 그대로 UDP로도 보낸다 (포맷 문자열을 두 번
+// 유지할 필요 없도록 호출부에서 snprintf로 한 번만 렌더링한 버퍼를 넘겨받는다). Fire-and-forget:
+// UDP이므로 실패해도 재시도하지 않고, 시리얼 로그 자체에는 영향이 없다.
+void sendTelemetryLine(const char* line, size_t len) {
+  if (len == 0) return;
+  telemetryUdp.beginPacket(telemetryHostIP, TELEMETRY_UDP_PORT);
+  telemetryUdp.write((const uint8_t*)line, len);
+  telemetryUdp.endPacket();
 }
 
 void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) {
@@ -593,6 +628,14 @@ void setup() {
   Serial.println("Teensy CAN1/CAN2 initialized.");
   Serial.println("-> Send 'e' to enable motors. Send 'c' to zero the status log (logging only, "
                   "does not affect control).");
+
+  Ethernet.begin(teensyStaticIP, teensySubnetMask, IPAddress(0, 0, 0, 0)); // 직결 케이블, 게이트웨이 없음
+  telemetryUdp.begin(TELEMETRY_UDP_PORT);
+  Serial.printf("Ethernet up: %d.%d.%d.%d | Telemetry UDP -> %d.%d.%d.%d:%d\r\n",
+                teensyStaticIP[0], teensyStaticIP[1], teensyStaticIP[2], teensyStaticIP[3],
+                telemetryHostIP[0], telemetryHostIP[1], telemetryHostIP[2], telemetryHostIP[3],
+                TELEMETRY_UDP_PORT);
+
   controlTimer = 0;
 }
 
@@ -744,22 +787,33 @@ void loop() {
       // 읽는 이 줄에만 영향). 캘리브레이션 전이면 zero_offset_*가 0.0이라 raw 그대로 찍힌다.
       // 포맷 자체(숫자 하나)는 캘리브레이션 이전과 동일하게 유지했다 -- teensy_link.py의
       // 정규식이 바뀔 필요가 없도록.
+      //
+      // 각 줄을 snprintf로 한 번만 버퍼에 렌더링한 뒤 Serial과 UDP 양쪽에 그대로 내보낸다 --
+      // 포맷 문자열을 두 곳에 따로 유지하지 않기 위함(위 주석에서 언급한 '포맷 불변' 요구와
+      // 동일한 이유).
+      char line_buf[160];
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-        Serial.printf("[CAN1] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
+        int len = snprintf(line_buf, sizeof(line_buf),
+                      "[CAN1] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
                       MST_IDS_CAN1[i], master_pos_can1[i] - zero_offset_master_can1[i],
                       SLV_IDS_CAN1[i], slave_pos_can1[i] - zero_offset_slave_can1[i],
                       pos_offset_can1[i],
                       (system_enabled && offset_ready_can1[i]) ? "ENABLED" : "DISABLED",
                       slave_trq_can1[i], mst_trq_state_can1[i].current_output_trq);
+        Serial.print(line_buf);
+        if (len > 0) sendTelemetryLine(line_buf, (size_t)len);
       }
 
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-        Serial.printf("[CAN2] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
+        int len = snprintf(line_buf, sizeof(line_buf),
+                      "[CAN2] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
                       MST_IDS_CAN2[i], master_pos_can2[i] - zero_offset_master_can2[i],
                       SLV_IDS_CAN2[i], slave_pos_can2[i] - zero_offset_slave_can2[i],
                       pos_offset_can2[i],
                       (system_enabled && offset_ready_can2[i]) ? "ENABLED" : "DISABLED",
                       slave_trq_can2[i], mst_trq_state_can2[i].current_output_trq);
+        Serial.print(line_buf);
+        if (len > 0) sendTelemetryLine(line_buf, (size_t)len);
       }
 
       Serial.println();
