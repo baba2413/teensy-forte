@@ -3,7 +3,7 @@
 #include <math.h>
 
 // -------------------------------------------------------------
-// 1. 모터 및 통신 설정 파라미터
+// 1. Motor and communication configuration parameters
 // -------------------------------------------------------------
 const uint8_t NUM_MOTORS_CAN1 = 2;
 const uint8_t MST_IDS_CAN1[NUM_MOTORS_CAN1 > 0 ? NUM_MOTORS_CAN1 : 1] = {1, 2};
@@ -17,27 +17,27 @@ const uint8_t HOST_ID = 253;
 
 #define SAFE_BUF_SIZE(n) ((n) > 0 ? (n) : 1)
 
-// 슬레이브 모터 위치 추종 게인
+// Slave motor position tracking gains
 const float SLV_KP = 24.0f;
 const float SLV_KD = 0.2f;
 
-// 마스터 모터 햅틱 피드백 토크 파라미터 (position-torque 방식)
-const float MAX_SAFE_TORQUE = 2.0f;       // 작업자 손목 보호용 최대 피드백 토크 (Nm)
-const float K_WALL = 15.0f;               // 슬레이브 한계 가상벽 반발 강도 (Nm/rad)
-const float MASTER_KD = 0.0f;             // 마스터 모터 능동 댐핑
-const uint32_t WATCHDOG_TIMEOUT_MS = 100; // 통신 끊김 판정 기준 (100ms)
+// Master motor haptic feedback torque parameters (position-torque method)
+const float MAX_SAFE_TORQUE = 2.0f;       // Max feedback torque to protect the operator's wrist (Nm)
+const float K_WALL = 15.0f;               // Slave limit virtual-wall repulsion strength (Nm/rad)
+const float MASTER_KD = 0.0f;             // Master motor active damping
+const uint32_t WATCHDOG_TIMEOUT_MS = 100; // Threshold for detecting a communication dropout (100ms)
 
-// 슬레이브 충돌 토크 -> 마스터 피드백 변환 파라미터 (민감도 튜닝용)
-const float SLAVE_TRQ_DEADZONE = 0.08f;   // 이 값 미만의 슬레이브 토크는 노이즈로 간주해 무시 (Nm)
-const float SLAVE_TRQ_GAIN = 0.8f;        // 슬레이브 토크 대비 마스터 피드백 반영 비율
-const float MASTER_TRQ_MAX_STEP = 2.0f;   // 2ms 주기당 최대 토크 변화량 (Nm) - 클수록 반응이 즉각적
+// Slave contact torque -> master feedback conversion parameters (for sensitivity tuning)
+const float SLAVE_TRQ_DEADZONE = 0.08f;   // Slave torque below this value is treated as noise and ignored (Nm)
+const float SLAVE_TRQ_GAIN = 0.8f;        // Ratio of slave torque reflected into master feedback
+const float MASTER_TRQ_MAX_STEP = 2.0f;   // Max torque change per 2ms period (Nm) - larger means more instantaneous response
 
-// Teensy 4.0/4.1 CAN1, CAN2 사용
+// Uses Teensy 4.0/4.1 CAN1, CAN2
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> Can2;
 
 // -------------------------------------------------------------
-// 2. Robstride 프로토콜 물리적 제한 한계값
+// 2. Robstride protocol physical limit values
 // -------------------------------------------------------------
 const float P_MIN = -12.5f;
 const float P_MAX = 12.5f;
@@ -48,12 +48,12 @@ const float KD_MAX = 5.0f;
 const float T_MIN = -18.0f;
 const float T_MAX = 18.0f;
 
-// 단방향 모터 절대 하드웨어 소프트웨어 제한 (-12.4 ~ +12.4 rad)
+// Unidirectional motor absolute hardware/software limit (-12.4 ~ +12.4 rad)
 const float RAW_LIMIT_MIN = -12.4f;
 const float RAW_LIMIT_MAX = 12.4f;
 
 // -------------------------------------------------------------
-// 3. 제어 주기 설정 (텔레오퍼레이션용 500 Hz / dt = 0.002초)
+// 3. Control period configuration (500 Hz for teleoperation / dt = 0.002s)
 // -------------------------------------------------------------
 const uint32_t CONTROL_PERIOD_US = 3333;
 elapsedMicros controlTimer;
@@ -61,9 +61,9 @@ elapsedMicros controlTimer;
 const uint32_t LOG_PERIOD = 1000;
 
 // -------------------------------------------------------------
-// 4. 실시간 상태, 오프셋 변수 및 제어 플래그
+// 4. Real-time state, offset variables, and control flags
 // -------------------------------------------------------------
-bool system_enabled = false; // 'e' 버튼 제어 활성화 여부
+bool system_enabled = false; // Whether control is enabled via the 'e' command
 
 volatile float master_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile float slave_pos_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
@@ -75,13 +75,13 @@ volatile float slave_pos_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 volatile float slave_trq_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 float pos_offset_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]          = {};
 
-// 통신 상태 왓치독 타임스탬프
+// Communication status watchdog timestamps
 volatile uint32_t last_rx_time_mst_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile uint32_t last_rx_time_slv_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile uint32_t last_rx_time_mst_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 volatile uint32_t last_rx_time_slv_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 
-// 마스터 토크 급변 제한(Slew Rate Limiter)용 이전 출력 상태
+// Previous output state for the master torque slew rate limiter
 struct MasterTorqueState {
   float current_output_trq = 0.0f;
 };
@@ -89,7 +89,7 @@ struct MasterTorqueState {
 MasterTorqueState mst_trq_state_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 MasterTorqueState mst_trq_state_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 
-// 오프셋 계산 전 새 피드백 수신 여부 확인
+// Tracks whether new feedback has been received, before offset calculation
 volatile bool master_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 volatile bool slave_valid_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
 volatile bool master_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
@@ -98,7 +98,7 @@ volatile bool slave_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 bool offset_ready_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 bool offset_ready_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 
-// Type 2 피드백의 fault 및 mode 상태 저장
+// Stores fault and mode state from Type 2 feedback
 volatile uint8_t fault_bits_can1[256] = {0};
 volatile uint8_t fault_bits_can2[256] = {0};
 volatile uint8_t motor_mode_can1[256] = {0};
@@ -107,7 +107,7 @@ volatile bool fault_changed_can1[256] = {false};
 volatile bool fault_changed_can2[256] = {false};
 
 // -------------------------------------------------------------
-// 5. 데이터 스케일링 및 진단 헬퍼 함수
+// 5. Data scaling and diagnostic helper functions
 // -------------------------------------------------------------
 uint16_t floatToUint(float x, float x_min, float x_max, uint8_t bits) {
   if (x < x_min) x = x_min;
@@ -119,7 +119,7 @@ float uintToFloat(uint16_t x, float x_min, float x_max) {
   return x_min + (float)x * (x_max - x_min) / 65535.0f;
 }
 
-// 슬레이브 충돌 토크 안전 정화 함수 (Deadzone + Slew Rate Limiter)
+// Slave contact torque safety conditioning function (Deadzone + Slew Rate Limiter)
 float processSlaveTorqueSafety(float slave_trq, MasterTorqueState &state) {
   float filtered_trq = slave_trq;
   if (fabsf(filtered_trq) < SLAVE_TRQ_DEADZONE) {
@@ -163,7 +163,7 @@ void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) 
 }
 
 // -------------------------------------------------------------
-// 6. Robstride CAN1 송신 제어 함수군
+// 6. Robstride CAN1 transmit control functions
 // -------------------------------------------------------------
 void enableMotorCan1(uint8_t motor_id) {
   CAN_message_t mode_msg;
@@ -202,7 +202,7 @@ CAN_message_t operationControlCan1(uint8_t motor_id, float feed_forward, float p
                                    float vel, float kp, float kd) {
   CAN_message_t msg;
 
-  // Raw Radian이 -12.4 ~ 12.4 rad 한계를 벗어나는 패킷은 버림
+  // Drop packets whose raw radian target falls outside the -12.4 ~ 12.4 rad limit
   if (pos < RAW_LIMIT_MIN || pos > RAW_LIMIT_MAX) {
     static uint32_t lastWarnMs[256] = {0};
     if (millis() - lastWarnMs[motor_id] > 200) {
@@ -237,7 +237,7 @@ CAN_message_t operationControlCan1(uint8_t motor_id, float feed_forward, float p
 }
 
 // -------------------------------------------------------------
-// 7. Robstride CAN2 송신 제어 함수군
+// 7. Robstride CAN2 transmit control functions
 // -------------------------------------------------------------
 void enableMotorCan2(uint8_t motor_id) {
   CAN_message_t mode_msg;
@@ -276,7 +276,7 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
                                    float vel, float kp, float kd) {
   CAN_message_t msg;
 
-  // Raw Radian이 -12.4 ~ 12.4 rad 한계를 벗어나는 패킷은 버림
+  // Drop packets whose raw radian target falls outside the -12.4 ~ 12.4 rad limit
   if (pos < RAW_LIMIT_MIN || pos > RAW_LIMIT_MAX) {
     static uint32_t lastWarnMs[256] = {0};
     if (millis() - lastWarnMs[motor_id] > 200) {
@@ -311,7 +311,7 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
 }
 
 // -------------------------------------------------------------
-// 8. CAN 수신 인터럽트 콜백
+// 8. CAN receive interrupt callback
 // -------------------------------------------------------------
 void rxCallbackCan1(const CAN_message_t &msg) {
   uint8_t mode = (msg.id >> 24) & 0x1F;
@@ -388,7 +388,7 @@ void rxCallbackCan2(const CAN_message_t &msg) {
 }
 
 // -------------------------------------------------------------
-// 9. 초기 위치 오프셋 측정 헬퍼 함수
+// 9. Initial position offset measurement helper function
 // -------------------------------------------------------------
 void setupOffset() {
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
@@ -407,7 +407,7 @@ void setupOffset() {
     last_rx_time_slv_can2[i] = 0;
   }
 
-  // 모터 피드백 유도를 위한 Dummy 명령 전송
+  // Send dummy command to induce motor feedback
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     operationControlCan1(MST_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
     operationControlCan1(SLV_IDS_CAN1[i], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -424,7 +424,7 @@ void setupOffset() {
     Can2.events();
   }
 
-  // CAN1 오프셋 계산
+  // CAN1 offset calculation
   for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
     uint8_t master_id = MST_IDS_CAN1[i];
     uint8_t slave_id = SLV_IDS_CAN1[i];
@@ -464,7 +464,7 @@ void setupOffset() {
                   motor_mode_can1[master_id], motor_mode_can1[slave_id]);
   }
 
-  // CAN2 오프셋 계산
+  // CAN2 offset calculation
   for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
     uint8_t master_id = MST_IDS_CAN2[i];
     uint8_t slave_id = SLV_IDS_CAN2[i];
@@ -507,7 +507,7 @@ void setupOffset() {
 }
 
 // -------------------------------------------------------------
-// 10. 메인 루프 구조
+// 10. Main loop structure
 // -------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -582,25 +582,25 @@ void loop() {
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 
-  // 2ms 주기 제어 루프 (500Hz)
+  // 2ms period control loop (500Hz)
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
-    // 슬레이브 위치 추종 게인
+    // Slave position tracking gains
     float slave_kp = SLV_KP;
     float slave_kd = SLV_KD;
 
-    // --- CAN1 Position-Torque 제어 ---
+    // --- CAN1 Position-Torque control ---
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
       bool watchdog_ok = (millis() - last_rx_time_mst_can1[i] <= WATCHDOG_TIMEOUT_MS) &&
                           (millis() - last_rx_time_slv_can1[i] <= WATCHDOG_TIMEOUT_MS);
 
       if (system_enabled && offset_ready_can1[i] && watchdog_ok) {
-        // 1. 슬레이브 목표 라디안 계산 (마스터를 추종, Raw 위치 기준)
+        // 1. Compute the slave target radians (tracking the master, based on raw position)
         float slave_target_raw = master_pos_can1[i] + pos_offset_can1[i];
         float limit_penetration = 0.0f;
 
-        // 하드웨어 프로토콜 한계(-12.4~12.4 rad) 가상벽
+        // Hardware protocol limit (-12.4~12.4 rad) virtual wall
         if (slave_target_raw < RAW_LIMIT_MIN || slave_target_raw > RAW_LIMIT_MAX) {
           limit_penetration += (slave_target_raw > RAW_LIMIT_MAX) ? (slave_target_raw - RAW_LIMIT_MAX) : (slave_target_raw - RAW_LIMIT_MIN);
 
@@ -619,7 +619,7 @@ void loop() {
 
         operationControlCan1(SLV_IDS_CAN1[i], 0.0f, slave_target_raw, 0.0f, slave_kp, slave_kd);
 
-        // 3. 마스터 피드백 토크 연산 (슬레이브 토크 기반 햅틱 피드백 + 한계 가상벽 반력)
+        // 3. Compute master feedback torque (slave-torque-based haptic feedback + limit virtual-wall reaction force)
         float master_trq = processSlaveTorqueSafety(slave_trq_can1[i], mst_trq_state_can1[i]);
         if (limit_penetration != 0.0f) {
           master_trq -= K_WALL * limit_penetration;
@@ -634,7 +634,7 @@ void loop() {
       }
     }
 
-    // --- CAN2 Position-Torque 제어 ---
+    // --- CAN2 Position-Torque control ---
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
       bool watchdog_ok = (millis() - last_rx_time_mst_can2[i] <= WATCHDOG_TIMEOUT_MS) &&
                           (millis() - last_rx_time_slv_can2[i] <= WATCHDOG_TIMEOUT_MS);
@@ -643,7 +643,7 @@ void loop() {
         float slave_target_raw = master_pos_can2[i] + pos_offset_can2[i];
         float limit_penetration = 0.0f;
 
-        // 하드웨어 프로토콜 한계(-12.4~12.4 rad) 가상벽
+        // Hardware protocol limit (-12.4~12.4 rad) virtual wall
         if (slave_target_raw < RAW_LIMIT_MIN || slave_target_raw > RAW_LIMIT_MAX) {
           limit_penetration += (slave_target_raw > RAW_LIMIT_MAX) ? (slave_target_raw - RAW_LIMIT_MAX) : (slave_target_raw - RAW_LIMIT_MIN);
 
@@ -676,7 +676,7 @@ void loop() {
       }
     }
 
-    // 500ms마다 상태 모니터링 출력
+    // Print status monitoring every 500ms
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint >= LOG_PERIOD) {
       lastPrint = millis();
@@ -705,7 +705,7 @@ void loop() {
 }
 
 // -------------------------------------------------------------
-// 11. 시리얼 명령 수신 인터럽트
+// 11. Serial command receive interrupt
 // -------------------------------------------------------------
 void serialEvent() {
   if (Serial.available()) {
