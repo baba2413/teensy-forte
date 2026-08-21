@@ -38,7 +38,7 @@ using namespace qindesign::network;
 // -------------------------------------------------------------
 
 // -------------------------------------------------------------
-// 1. 모터 및 통신 설정 파라미터
+// 1. Motor and communication configuration parameters
 // -------------------------------------------------------------
 const uint8_t NUM_MOTORS_CAN1 = 2;
 const uint8_t SLV_IDS_CAN1[NUM_MOTORS_CAN1] = {11, 12}; // shoulder_yaw, shoulder_roll
@@ -48,51 +48,54 @@ const uint8_t SLV_IDS_CAN2[NUM_MOTORS_CAN2] = {13, 14}; // shoulder_pitch, elbow
 
 const uint8_t HOST_ID = 253;
 
-// 위치 추종 게인 (teleop-bi-p-t의 SLV_KP/KD와 동일한 값으로 시작)
+// Position tracking gains (starting from the same values as teleop-bi-p-t's SLV_KP/KD)
 const float SLV_KP = 10.0f;
 const float SLV_KD = 0.1f;
 
-// GOAL 모드 설정. isaacsim-udp의 WATCHDOG_TIMEOUT_MS와 동일한 500ms -- 유선 시리얼 바이트
-// 스트림보다 UDP 쪽이 패킷 유실 특성이 다르므로, 이전 시리얼 버전의 150ms보다 여유를 둔다.
+// GOAL mode configuration. Same 500ms as isaacsim-udp's WATCHDOG_TIMEOUT_MS -- UDP has
+// different packet-loss characteristics than a wired serial byte stream, so this leaves more
+// margin than the previous serial version's 150ms.
 const uint32_t GOAL_TIMEOUT_MS = 500;
 
-// 'd' 직후 이 시간(ms) 동안은 들어오는 UDP 목표 패킷을 전부 무시한다. UDP(목표 스트림)와
-// 시리얼('d')은 서로 동기화되지 않는 완전히 별개의 채널이라, 'd'를 보내기 직전에 호스트가
-// 이미 보내둔 목표 패킷이 'd' 처리 *이후*에 도착할 수 있다 -- handleGoalPacket()은 원래
-// 유효한 패킷이면 무조건 enterGoalModeIfNeeded()를 부르므로, 이 stray 패킷 하나가 방금 건
-// 'd'를 무효화하고 (심지어 캘리브레이션도 안 된 채로) 모터를 재활성화해버린다. 실측으로
-// 재현된 문제 -- 'd'는 순간적인 킬 스위치여야 하므로, 짧은 무시 구간으로 이 경합을 막는다.
+// For this long (ms) right after 'd', ignore all incoming UDP goal packets entirely. UDP (the
+// goal stream) and serial ('d') are completely separate channels with no synchronization between
+// them, so a goal packet the host already sent just before 'd' can arrive *after* 'd' is
+// processed -- handleGoalPacket() unconditionally calls enterGoalModeIfNeeded() for any valid
+// packet, so that one stray packet would invalidate the 'd' that was just sent (even without
+// calibration) and re-enable the motors. This was a problem reproduced in real testing -- since
+// 'd' needs to act as an instant kill switch, a brief ignore window blocks this race.
 const uint32_t DISABLE_IGNORE_MS = 300;
 uint32_t ignore_goal_packets_until_ms = 0;
 
-// 네트워크 설정 (isaacsim-udp 브랜치와 동일 -- 실제로 이 하드웨어에서 검증된 설정을 그대로 사용).
-// 직결 케이블 전제라 게이트웨이는 없음(0.0.0.0).
+// Network configuration (same as the isaacsim-udp branch -- reuses settings already verified
+// on this hardware). Assumes a direct cable connection, so there's no gateway (0.0.0.0).
 IPAddress staticIP(192, 168, 1, 15);
 IPAddress subnetMask(255, 255, 255, 0);
 const uint16_t UDP_PORT = 5005;
 EthernetUDP udp;
 
-// 'c' 소프트웨어 영점 + 관절별 이동 한계 (teensy-forte teleop-bi 브랜치의 "modify" 커밋에서
-// 포팅, raw 모터 라디안 기준으로 재구성) -- 이 펌웨어는 기어비를 전혀 적용하지 않으므로
-// (lerobot_robot_forte_arm의 SMOLVLA_GUIDE.md §2 참고) 원본의 관절-공간/기어비 나눗셈은
-// 가져오지 않았다. 'c'로 잡은 현재 raw 위치가 그 모터의 영점이 되고, 이후 목표값은
-// [영점 + MIN, 영점 + MAX] 범위로 클램프된다.
-// J1 (Yaw)   : [-2.2086 rad, +2.2086 rad] (기존 2.4086에서 0.2 감소)
-// J2 (Roll)  : [-2.2800 rad, +2.2800 rad] (기존 2.4800에서 0.2 감소)
-// J3 (Pitch) : [-2.3000 rad, +0.1000 rad] (음수 동작, 한계 0.2 감소 및 초기점 +0.1 여유)
-// J4 (Pitch) : [-0.1000 rad, +0.9500 rad] (양수 동작, 한계 0.2 감소 및 초기점 -0.1 여유)
+// 'c' software zero + per-joint travel limits (ported from the "modify" commit on the
+// teensy-forte teleop-bi branch, reworked in terms of raw motor radians) -- this firmware applies
+// no gear ratio at all (see §2 of lerobot_robot_forte_arm's SMOLVLA_GUIDE.md), so the original's
+// joint-space/gear-ratio division was not carried over. The current raw position captured by 'c'
+// becomes that motor's zero, and subsequent targets are clamped to the range
+// [zero + MIN, zero + MAX].
+// J1 (Yaw)   : [-2.2086 rad, +2.2086 rad] (reduced by 0.2 from the previous 2.4086)
+// J2 (Roll)  : [-2.2800 rad, +2.2800 rad] (reduced by 0.2 from the previous 2.4800)
+// J3 (Pitch) : [-2.3000 rad, +0.1000 rad] (negative-direction motion, limit reduced by 0.2 with +0.1 margin on the initial point)
+// J4 (Pitch) : [-0.1000 rad, +0.9500 rad] (positive-direction motion, limit reduced by 0.2 with -0.1 margin on the initial point)
 const float JOINT_LIMIT_MIN_CAN1[NUM_MOTORS_CAN1] = {-2.2086f, -2.2800f};
 const float JOINT_LIMIT_MAX_CAN1[NUM_MOTORS_CAN1] = { 2.2086f,  2.2800f};
 
 const float JOINT_LIMIT_MIN_CAN2[NUM_MOTORS_CAN2] = {-2.3000f, -0.1000f};
 const float JOINT_LIMIT_MAX_CAN2[NUM_MOTORS_CAN2] = { 0.1000f,  0.9500f};
 
-// Teensy 4.0/4.1 CAN1, CAN2 사용 (모터 11,12는 CAN1 / 13,14는 CAN2 배선)
+// Uses Teensy 4.0/4.1 CAN1, CAN2 (motors 11,12 wired to CAN1 / 13,14 wired to CAN2)
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> Can2;
 
 // -------------------------------------------------------------
-// 2. Robstride 프로토콜 물리적 제한 한계값
+// 2. Robstride protocol physical limit values
 // -------------------------------------------------------------
 const float P_MIN = -12.5f;
 const float P_MAX = 12.5f;
@@ -103,12 +106,12 @@ const float KD_MAX = 5.0f;
 const float T_MIN = -18.0f;
 const float T_MAX = 18.0f;
 
-// 단방향 모터 절대 하드웨어 소프트웨어 제한 (-12.4 ~ +12.4 rad)
+// Unidirectional motor absolute hardware/software limit (-12.4 ~ +12.4 rad)
 const float RAW_LIMIT_MIN = -12.4f;
 const float RAW_LIMIT_MAX = 12.4f;
 
 // -------------------------------------------------------------
-// 3. 제어 주기 설정 (300Hz / dt = 3.333ms)
+// 3. Control period configuration (300Hz / dt = 3.333ms)
 // -------------------------------------------------------------
 const uint32_t CONTROL_PERIOD_US = 3333;
 elapsedMicros controlTimer;
@@ -116,31 +119,32 @@ elapsedMicros controlTimer;
 const uint32_t LOG_PERIOD = 1000;
 
 // -------------------------------------------------------------
-// 4. 실시간 상태 및 제어 플래그
+// 4. Real-time state and control flags
 // -------------------------------------------------------------
-bool goal_mode_enabled = false; // UDP 패킷으로 진입, 'd'로 해제
-bool is_calibrated = false;     // 'c'로 진입 -- 영점(zero_offset_*)이 현재 유효한지
+bool goal_mode_enabled = false; // Entered via UDP packet, cleared with 'd'
+bool is_calibrated = false;     // Entered via 'c' -- whether the zero (zero_offset_*) is currently valid
 
 volatile float slave_pos_can1[NUM_MOTORS_CAN1] = {};
 volatile float slave_trq_can1[NUM_MOTORS_CAN1] = {};
-volatile bool slave_valid_can1[NUM_MOTORS_CAN1] = {}; // CAN 피드백을 한 번이라도 받았는지
+volatile bool slave_valid_can1[NUM_MOTORS_CAN1] = {}; // Whether CAN feedback has been received at least once
 volatile float slave_pos_can2[NUM_MOTORS_CAN2] = {};
 volatile float slave_trq_can2[NUM_MOTORS_CAN2] = {};
 volatile bool slave_valid_can2[NUM_MOTORS_CAN2] = {};
 
-// 'c'로 잡은 영점 (raw 모터 라디안). JOINT_LIMIT_MIN/MAX_CAN1/CAN2가 이 값 기준 상대 범위다.
+// Zero captured via 'c' (raw motor radians). JOINT_LIMIT_MIN/MAX_CAN1/CAN2 are ranges relative to this value.
 float zero_offset_can1[NUM_MOTORS_CAN1] = {};
 float zero_offset_can2[NUM_MOTORS_CAN2] = {};
 
-// GOAL 모드에서 추종할 목표 원시 라디안. 인덱스는 SLV_IDS_CAN1/CAN2 배열과 동일한 순서
-// (CAN 배선 기준: goal_target_can1[0]=11, [1]=12, goal_target_can2[0]=13, [1]=14).
-// 주의: 이건 CAN 배선 순서이지 UDP 패킷의 페이로드 순서(yaw,pitch,roll,elbow)와 다르다 --
-// handleGoalPacket()이 그 사이를 매핑한다.
+// Target raw radians to track in GOAL mode. Indices follow the same order as the
+// SLV_IDS_CAN1/CAN2 arrays (CAN wiring order: goal_target_can1[0]=11, [1]=12,
+// goal_target_can2[0]=13, [1]=14).
+// Note: this is CAN wiring order, not the UDP packet's payload order (yaw,pitch,roll,elbow) --
+// handleGoalPacket() maps between the two.
 float goal_target_can1[NUM_MOTORS_CAN1] = {};
 float goal_target_can2[NUM_MOTORS_CAN2] = {};
-uint32_t last_goal_rx_time = 0; // 마지막으로 유효한 UDP 목표 패킷을 받은 시각 (GOAL_TIMEOUT_MS 왓치독용)
+uint32_t last_goal_rx_time = 0; // Timestamp of the last valid UDP goal packet received (for the GOAL_TIMEOUT_MS watchdog)
 
-// Type 2 피드백의 fault 및 mode 상태 저장 (motor_id로 바로 인덱싱)
+// Stores fault and mode state from Type 2 feedback (indexed directly by motor_id)
 volatile uint8_t fault_bits_can1[256] = {0};
 volatile uint8_t fault_bits_can2[256] = {0};
 volatile uint8_t motor_mode_can1[256] = {0};
@@ -149,7 +153,7 @@ volatile bool fault_changed_can1[256] = {false};
 volatile bool fault_changed_can2[256] = {false};
 
 // -------------------------------------------------------------
-// 5. 데이터 스케일링 및 진단 헬퍼 함수
+// 5. Data scaling and diagnostic helper functions
 // -------------------------------------------------------------
 uint16_t floatToUint(float x, float x_min, float x_max, uint8_t bits) {
   if (x < x_min) x = x_min;
@@ -180,7 +184,7 @@ void printFaultBits(const char* can_name, uint8_t motor_id, uint8_t fault_bits) 
 }
 
 // -------------------------------------------------------------
-// 6. Robstride CAN1 송신 제어 함수군
+// 6. Robstride CAN1 transmit control functions
 // -------------------------------------------------------------
 void enableMotorCan1(uint8_t motor_id) {
   CAN_message_t mode_msg;
@@ -219,7 +223,7 @@ CAN_message_t operationControlCan1(uint8_t motor_id, float feed_forward, float p
                                    float vel, float kp, float kd) {
   CAN_message_t msg;
 
-  // Raw Radian이 -12.4 ~ 12.4 rad 한계를 벗어나는 패킷은 버림
+  // Drop packets whose raw radian target falls outside the -12.4 ~ 12.4 rad limit
   if (pos < RAW_LIMIT_MIN || pos > RAW_LIMIT_MAX) {
     static uint32_t lastWarnMs[256] = {0};
     if (millis() - lastWarnMs[motor_id] > 200) {
@@ -254,7 +258,7 @@ CAN_message_t operationControlCan1(uint8_t motor_id, float feed_forward, float p
 }
 
 // -------------------------------------------------------------
-// 7. Robstride CAN2 송신 제어 함수군
+// 7. Robstride CAN2 transmit control functions
 // -------------------------------------------------------------
 void enableMotorCan2(uint8_t motor_id) {
   CAN_message_t mode_msg;
@@ -293,7 +297,7 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
                                    float vel, float kp, float kd) {
   CAN_message_t msg;
 
-  // Raw Radian이 -12.4 ~ 12.4 rad 한계를 벗어나는 패킷은 버림
+  // Drop packets whose raw radian target falls outside the -12.4 ~ 12.4 rad limit
   if (pos < RAW_LIMIT_MIN || pos > RAW_LIMIT_MAX) {
     static uint32_t lastWarnMs[256] = {0};
     if (millis() - lastWarnMs[motor_id] > 200) {
@@ -328,7 +332,7 @@ CAN_message_t operationControlCan2(uint8_t motor_id, float feed_forward, float p
 }
 
 // -------------------------------------------------------------
-// 8. CAN 수신 인터럽트 콜백
+// 8. CAN receive interrupt callback
 // -------------------------------------------------------------
 void rxCallbackCan1(const CAN_message_t &msg) {
   uint8_t mode = (msg.id >> 24) & 0x1F;
@@ -391,7 +395,7 @@ void rxCallbackCan2(const CAN_message_t &msg) {
 }
 
 // -------------------------------------------------------------
-// 8b. 'c' 소프트웨어 영점 캘리브레이션
+// 8b. 'c' software zero calibration
 // -------------------------------------------------------------
 void calibrateZero() {
   Serial.println("[Teensy] Calibrating zero offset from current pose...");
@@ -430,7 +434,7 @@ void calibrateZero() {
 }
 
 // -------------------------------------------------------------
-// 9. GOAL 모드 (UDP 전용): 목표 위치 패킷 파싱 및 진입 처리
+// 9. GOAL mode (UDP only): goal position packet parsing and mode entry handling
 // -------------------------------------------------------------
 void enterGoalModeIfNeeded() {
   if (goal_mode_enabled) return;
@@ -454,14 +458,15 @@ void enterGoalModeIfNeeded() {
   }
 }
 
-// buf는 NUL로 끝나는 문자열. UDP 패킷 하나당 정확히 "<v0>,<v1>,<v2>,<v3>" 형태를 기대한다 --
-// 시리얼 버전의 "값 없이 개행만 오는 bare 명령" 개념은 없다: UDP를 쓰는 쪽은 항상 파이썬
-// 스크립트이고, 완전한 4개 값을 보내는 것이 자연스럽다 (현재 위치를 유지하고 싶으면 호출자가
-// 그 값을 그대로 다시 보내면 된다).
+// buf is a NUL-terminated string. Each UDP packet is expected to be exactly in the form
+// "<v0>,<v1>,<v2>,<v3>" -- there's no concept of the serial version's "bare command with just a
+// newline, no value": the UDP side is always a Python script, and sending the complete 4 values
+// is natural (if the caller wants to hold the current position, it just sends that same value
+// back).
 void handleGoalPacket(char* buf) {
   if (millis() < ignore_goal_packets_until_ms) {
-    // 'd' 직후 무시 구간 -- DISABLE_IGNORE_MS 참고. 'd' 이전에 이미 보내진 stray 패킷이
-    // 뒤늦게 도착해 방금 건 disable을 무효화하는 걸 막는다.
+    // Ignore window right after 'd' -- see DISABLE_IGNORE_MS. Prevents a stray packet already
+    // sent before 'd' from arriving late and invalidating the disable that was just issued.
     Serial.println("[Teensy] GOAL packet ignored (just disabled, dropping stragglers briefly).");
     return;
   }
@@ -482,8 +487,9 @@ void handleGoalPacket(char* buf) {
   if (i != 4 || !all_finite) {
     Serial.printf("[Teensy] GOAL packet REJECTED (need exactly 4 finite comma-separated floats, "
                   "got %d)\r\n", i);
-    return; // UDP는 패킷 단위라 시리얼 라인처럼 "덜 온 상태로 갇힐" 위험이 없으므로, 잘못된
-             // 패킷에도 왓치독을 갱신해줄 필요가 없다 -- 다음 정상 패킷이 오면 그때 갱신된다.
+    return; // UDP is packet-based, so unlike a serial line there's no risk of getting stuck in a
+             // "partially received" state -- there's no need to refresh the watchdog even for a
+             // bad packet, since it will be refreshed once the next valid packet arrives.
   }
 
   // Payload order is kinematic (yaw, pitch, roll, elbow), not CAN-wiring order --
@@ -498,7 +504,7 @@ void handleGoalPacket(char* buf) {
 }
 
 // -------------------------------------------------------------
-// 10. 메인 루프 구조
+// 10. Main loop structure
 // -------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -526,7 +532,7 @@ void setup() {
 
   Serial.println("CAN1/CAN2 initialized.");
 
-  Ethernet.begin(staticIP, subnetMask, IPAddress(0, 0, 0, 0)); // 직결 케이블, 게이트웨이 없음
+  Ethernet.begin(staticIP, subnetMask, IPAddress(0, 0, 0, 0)); // Direct cable, no gateway
   udp.begin(UDP_PORT);
   Serial.printf("Ethernet up: %d.%d.%d.%d, UDP port %d\r\n",
                 staticIP[0], staticIP[1], staticIP[2], staticIP[3], UDP_PORT);
@@ -540,8 +546,8 @@ void loop() {
   Can1.events();
   Can2.events();
 
-  // UDP 수신 처리 -- 패킷은 네트워크 스택이 이미 통째로 재조립해주므로, 시리얼 버전처럼
-  // 바이트 단위로 누적하는 상태 기계가 필요 없다.
+  // Handle UDP receive -- the network stack already reassembles each packet as a whole, so
+  // unlike the serial version, no byte-by-byte accumulating state machine is needed.
   int packetSize = udp.parsePacket();
   if (packetSize > 0) {
     char packetBuffer[64];
@@ -582,18 +588,18 @@ void loop() {
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
 
-  // 3.333ms 주기 제어 루프 (300Hz)
+  // 3.333ms period control loop (300Hz)
   if (controlTimer >= CONTROL_PERIOD_US) {
     controlTimer -= CONTROL_PERIOD_US;
 
-    // GOAL 모드 왓치독: 유예 시간 안에 새 UDP 목표 패킷이 없으면 자동으로 모드 해제(정지).
+    // GOAL mode watchdog: if no new UDP goal packet arrives within the grace period, automatically exit the mode (stop).
     if (goal_mode_enabled && (millis() - last_goal_rx_time > GOAL_TIMEOUT_MS)) {
       goal_mode_enabled = false;
       Serial.println("[Teensy] GOAL mode WATCHDOG TIMEOUT (no UDP packet received) - motors "
                       "stopped. Send a new goal packet to resume.");
     }
 
-    // --- CAN1 제어 ---
+    // --- CAN1 control ---
     for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
       if (goal_mode_enabled) {
         float target = goal_target_can1[i];
@@ -616,7 +622,7 @@ void loop() {
       }
     }
 
-    // --- CAN2 제어 ---
+    // --- CAN2 control ---
     for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
       if (goal_mode_enabled) {
         float target = goal_target_can2[i];
@@ -639,7 +645,7 @@ void loop() {
       }
     }
 
-    // 1000ms마다 상태 모니터링 출력
+    // Print status monitoring every 1000ms
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint >= LOG_PERIOD) {
       lastPrint = millis();
@@ -677,8 +683,9 @@ void loop() {
 }
 
 // -------------------------------------------------------------
-// 11. 시리얼 명령 수신 인터럽트 -- 'c'/'d' 뿐, 둘 다 단일 문자 즉시 명령이라 라인 버퍼링이나
-// 상태 기계가 전혀 필요 없다 (UDP로 옮기기 전 'g'가 있었을 때와 달리).
+// 11. Serial command receive interrupt -- only 'c'/'d', both single-character immediate
+// commands, so no line buffering or state machine is needed at all (unlike when 'g' existed
+// before being moved to UDP).
 // -------------------------------------------------------------
 void serialEvent() {
   while (Serial.available()) {
@@ -701,6 +708,6 @@ void serialEvent() {
 
       Serial.println("[Teensy] Motors Disabled. Send 'c' to re-calibrate before sending goal packets again.");
     }
-    // 그 외 문자는 명령이 아니므로 무시.
+    // Any other character is not a command, so it's ignored.
   }
 }
