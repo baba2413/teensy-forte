@@ -1,22 +1,25 @@
 """
-Teensy가 모터로 실제 전송하는 위치 커맨드(link/motor axis)를 실시간으로 그래프로 그려주는 도구.
+A tool that plots, in real time, the position commands (link/motor axis) that Teensy actually
+sends to the motors.
 
-teensy.ino의 제어 루프(50Hz)는 매 tick마다 각 조인트에 보낼 위치를 계산해서 CAN으로
-전송하는데, 이 값(last_cmd_link_pos / last_cmd_motor_pos)을 시리얼로도 CSV 한 줄씩
-내보내도록 firmware에 'g' 명령(plotStreamEnabled 토글)을 추가해두었다. 이 스크립트는
-"PLOT,..." 로 시작하는 줄만 파싱해 실시간 그래프로 그린다.
+teensy.ino's control loop (50Hz) computes the position to send to each joint every tick and
+transmits it over CAN; a 'g' command (toggling plotStreamEnabled) was added to the firmware so
+that this same value (last_cmd_link_pos / last_cmd_motor_pos) is also emitted over serial as one
+CSV line. This script only parses lines starting with "PLOT,..." and plots them in real time.
 
-데이터 소스는 두 가지 모드가 있다:
-  1. --port  : 이 스크립트가 시리얼 포트를 직접 연다 (PuTTY 등 다른 프로그램이 그
-               포트를 이미 열어두면 Windows에서는 동시에 열 수 없어 실패한다).
-  2. --logfile : PuTTY가 세션 로깅으로 기록 중인 텍스트 파일을 tail -f 처럼 읽는다.
-               PuTTY를 계속 시리얼 콘솔로 써야 할 때 이 모드를 쓴다. PuTTY 설정:
-               Session > Logging > Log file to write to = 이 파일 경로,
-               Logging 방식은 "Printable output" 또는 "All session output" 아무거나 OK.
-               이 모드에서는 'g' 명령을 스크립트가 대신 보낼 수 없으므로, PLOT 데이터가
-               안 보이면 PuTTY 창에 직접 g를 입력해 스트림을 켜야 한다.
+There are two data source modes:
+  1. --port  : this script opens the serial port directly (if another program such as PuTTY
+               already has the port open, this fails on Windows since it can't be opened at the
+               same time).
+  2. --logfile : reads, like tail -f, a text file that PuTTY is writing to via session logging.
+               Use this mode when PuTTY needs to keep being used as the serial console. PuTTY
+               settings:
+               Session > Logging > Log file to write to = this file's path,
+               the logging mode can be either "Printable output" or "All session output".
+               In this mode the script can't send the 'g' command on your behalf, so if PLOT data
+               isn't showing up, type g directly into the PuTTY window to turn the stream on.
 
-사용법은 파일 하단 또는 `python plot_positions.py --help` 참고.
+See the bottom of the file, or `python plot_positions.py --help`, for usage.
 """
 
 import argparse
@@ -31,11 +34,11 @@ from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 JOINT_NAMES = ["shoulder_yaw", "shoulder_pitch", "shoulder_roll", "elbow_pitch"]
-JOINT_CAN_IDS = [11, 13, 12, 14]  # teensy.ino의 JOINT_CAN_IDS와 동일 순서/값을 유지할 것
+JOINT_CAN_IDS = [11, 13, 12, 14]  # Keep the same order/values as teensy.ino's JOINT_CAN_IDS
 BAUD_DEFAULT = 115200
 
-# 조인트별로 그래프에 그릴지 여부를 CAN ID 기준 true/false로 토글.
-# 여기 없는 CAN ID는 기본 True로 취급.
+# Toggle per-joint whether to plot it, keyed by CAN ID as true/false.
+# Any CAN ID not listed here defaults to True.
 ENABLED_MOTORS = {
     11: True,   # shoulder_yaw
     13: True,   # shoulder_pitch
@@ -56,39 +59,39 @@ def pick_port(explicit_port):
         return explicit_port
     ports = list(serial.tools.list_ports.comports())
     if len(ports) == 1:
-        print(f"[plot_positions] 포트 자동 선택: {ports[0].device}")
+        print(f"[plot_positions] Auto-selected port: {ports[0].device}")
         return ports[0].device
-    print("[plot_positions] --port 로 시리얼 포트를 지정하세요. 사용 가능한 포트:")
+    print("[plot_positions] Specify the serial port with --port. Available ports:")
     list_ports()
     sys.exit(1)
 
 
 def ensure_stream_enabled(ser, timeout_s=2.0):
-    """이미 PLOT 스트림이 켜져 있는지 확인하고, 꺼져 있으면 'g'를 보내 켠다."""
+    """Checks whether the PLOT stream is already on, and sends 'g' to turn it on if it's off."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         line = ser.readline().decode(errors="ignore").strip()
         if line.startswith("PLOT,"):
-            print("[plot_positions] 기존에 스트림이 켜져 있음. 그대로 사용합니다.")
+            print("[plot_positions] Stream is already on. Using it as-is.")
             return
-    print("[plot_positions] 스트림이 꺼져 있어 'g' 명령을 전송해 켭니다.")
+    print("[plot_positions] Stream is off, sending the 'g' command to turn it on.")
     ser.write(b"g")
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         line = ser.readline().decode(errors="ignore").strip()
         if line.startswith("PLOT,"):
             return
-    print("[plot_positions] 경고: 'g' 전송 후에도 PLOT 데이터가 보이지 않습니다. "
-          "Teensy가 UDP로 위치 명령을 받고 있는지 확인하세요 (ext_control_active).")
+    print("[plot_positions] WARNING: PLOT data still not visible after sending 'g'. "
+          "Check whether Teensy is receiving position commands over UDP (ext_control_active).")
 
 
 class SerialSource:
-    """이 스크립트가 시리얼 포트를 직접 열어 읽는 모드."""
+    """Mode where this script opens the serial port directly and reads it."""
 
     def __init__(self, port, baud):
-        print(f"[plot_positions] {port} @ {baud}bps 연결 중...")
+        print(f"[plot_positions] Connecting to {port} @ {baud}bps...")
         self.ser = serial.Serial(port, baud, timeout=0.5)
-        time.sleep(2.0)  # Teensy USB 시리얼 재연결 시 리셋되는 경우 대비
+        time.sleep(2.0)  # In case Teensy resets on USB serial reconnect
         self.ser.reset_input_buffer()
         ensure_stream_enabled(self.ser)
 
@@ -105,21 +108,21 @@ class SerialSource:
 
 
 class LogFileSource:
-    """PuTTY가 세션 로깅으로 기록 중인 파일을 tail -f 방식으로 읽는 모드.
-    PuTTY가 포트를 독점하고 있어 이 스크립트가 직접 포트를 열 수 없을 때 사용."""
+    """Mode that reads, like tail -f, a file PuTTY is writing to via session logging.
+    Used when PuTTY has exclusive hold of the port and this script can't open it directly."""
 
     def __init__(self, path):
         self.path = path
-        print(f"[plot_positions] 로그 파일 tail 모드: {path}")
+        print(f"[plot_positions] Log file tail mode: {path}")
         deadline = time.time() + 10.0
         while not os.path.exists(path):
             if time.time() > deadline:
                 raise FileNotFoundError(
-                    f"{path} 가 없습니다. PuTTY의 Session > Logging 에서 이 경로로 로깅을 켰는지 확인하세요."
+                    f"{path} does not exist. Check whether PuTTY's Session > Logging has logging turned on to this path."
                 )
             time.sleep(0.2)
         self._fh = open(path, "r", encoding="utf-8", errors="ignore")
-        self._fh.seek(0, os.SEEK_END)  # 새로 추가되는 내용부터만 읽음
+        self._fh.seek(0, os.SEEK_END)  # Only read content added from here on
         self._pos = self._fh.tell()
         self._start_time = time.time()
         self._warned = False
@@ -129,14 +132,14 @@ class LogFileSource:
             size = os.path.getsize(self.path)
         except OSError:
             return []
-        if size < self._pos:  # PuTTY가 로그 파일을 새로 만든 경우 (재시작 등)
+        if size < self._pos:  # In case PuTTY created a new log file (e.g. on restart)
             self._fh.seek(0)
             self._pos = 0
         lines_read = [raw.rstrip("\r\n") for raw in self._fh if raw.strip()]
         self._pos = self._fh.tell()
         if not lines_read and not self._warned and time.time() - self._start_time > 5.0:
-            print("[plot_positions] 로그 파일에 PLOT 데이터가 없습니다. "
-                  "PuTTY 창에 직접 'g'를 입력해 스트림을 켜세요.")
+            print("[plot_positions] No PLOT data in the log file. "
+                  "Type 'g' directly into the PuTTY window to turn on the stream.")
             self._warned = True
         return lines_read
 
@@ -161,15 +164,15 @@ def parse_plot_line(line):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--port", help="시리얼 포트 (예: COM5). 생략 시 자동 감지 시도")
+    ap.add_argument("--port", help="Serial port (e.g. COM5). If omitted, attempts auto-detection")
     ap.add_argument("--baud", type=int, default=BAUD_DEFAULT)
     ap.add_argument("--logfile",
-                     help="시리얼 포트를 직접 여는 대신, PuTTY 세션 로깅으로 기록 중인 파일을 tail 방식으로 읽음 "
-                          "(PuTTY가 포트를 이미 점유하고 있어 --port 를 못 쓸 때 사용)")
-    ap.add_argument("--window", type=float, default=10.0, help="화면에 표시할 최근 구간(초), 기본 10초")
+                     help="Instead of opening the serial port directly, tail a file PuTTY is writing to via session logging "
+                          "(use when PuTTY already occupies the port and --port can't be used)")
+    ap.add_argument("--window", type=float, default=10.0, help="Recent time span to display (seconds), default 10s")
     ap.add_argument("--motor", action="store_true",
-                     help="link axis(rad) 대신 motor axis(기어비 적용 후) 위치를 표시")
-    ap.add_argument("--list-ports", action="store_true", help="사용 가능한 시리얼 포트만 출력하고 종료")
+                     help="Show motor axis (after gear ratio applied) position instead of link axis (rad)")
+    ap.add_argument("--list-ports", action="store_true", help="Print available serial ports only, then exit")
     args = ap.parse_args()
 
     if args.list_ports:
@@ -177,7 +180,7 @@ def main():
         return
 
     if args.logfile and args.port:
-        print("[plot_positions] --port 와 --logfile 은 동시에 쓸 수 없습니다.")
+        print("[plot_positions] --port and --logfile cannot be used together.")
         sys.exit(1)
 
     if args.logfile:
@@ -187,7 +190,7 @@ def main():
 
     enabled_idx = [i for i in range(4) if ENABLED_MOTORS.get(JOINT_CAN_IDS[i], True)]
     if not enabled_idx:
-        print("[plot_positions] ENABLED_MOTORS 에서 모든 조인트가 False 입니다. 최소 하나는 켜세요.")
+        print("[plot_positions] All joints are False in ENABLED_MOTORS. Enable at least one.")
         sys.exit(1)
 
     buf_t = [deque() for _ in range(4)]
