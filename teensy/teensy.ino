@@ -2,18 +2,18 @@
 #include <FlexCAN_T4.h>
 
 // -------------------------------------------------------------
-// 1. 모터 ID 리스트 및 설정
+// 1. Motor ID list and configuration
 // -------------------------------------------------------------
 const uint8_t MOTOR_IDS[] = {1,2,3,4,11,12,13,14}; 
 const size_t NUM_MOTORS = sizeof(MOTOR_IDS) / sizeof(MOTOR_IDS[0]);
 
-const uint32_t PRINT_PERIOD_MS = 2000; // 시리얼 출력 및 LED 반전 주기 (100ms = 0.1초)
+const uint32_t PRINT_PERIOD_MS = 2000; // Serial output and LED toggle period (100ms = 0.1s)
 
-// Teensy 4.0/4.1 CAN1 사용 설정
+// Teensy 4.0/4.1 CAN1 usage configuration
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 
 // -------------------------------------------------------------
-// 2. Robstride 프로토콜 물리적 한계값 (스케일 변환용)
+// 2. Robstride protocol physical limit values (for scale conversion)
 // -------------------------------------------------------------
 const float P_MIN = -12.5f;
 const float P_MAX = 12.5f;
@@ -23,22 +23,22 @@ const float T_MIN = -18.0f;
 const float T_MAX = 18.0f;
 
 // -------------------------------------------------------------
-// 3. 모터 상태 저장 구조체 및 글로벌 변수
+// 3. Motor state storage struct and global variables
 // -------------------------------------------------------------
 struct MotorStatus {
   uint8_t id;
-  float pos;       // 위치 (rad)
-  float vel;       // 속도 (rad/s)
-  float torque;    // 토크 (Nm)
-  bool updated;    // 피드백 수신 여부
+  float pos;       // Position (rad)
+  float vel;       // Velocity (rad/s)
+  float torque;    // Torque (Nm)
+  bool updated;    // Whether feedback was received
 };
 
 MotorStatus motorStates[NUM_MOTORS];
 elapsedMillis printTimer;
-bool ledState = false; // 내장 LED 토글용 상태 변수
+bool ledState = false; // State variable for toggling the built-in LED
 
 // -------------------------------------------------------------
-// 4. 변환 및 헬퍼 함수
+// 4. Conversion and helper functions
 // -------------------------------------------------------------
 float uintToFloat(uint16_t x, float x_min, float x_max) {
   return x_min + (float)x * (x_max - x_min) / 65535.0f;
@@ -79,7 +79,7 @@ void requestMotorStatus(uint8_t motor_id) {
 }
 
 // -------------------------------------------------------------
-// 5. CAN 수신 콜백 함수 (피드백 데이터 파싱)
+// 5. CAN receive callback function (parse feedback data)
 // -------------------------------------------------------------
 void rxCallback(const CAN_message_t &msg) {
   uint8_t mode = (msg.id >> 24) & 0x1F;
@@ -107,10 +107,10 @@ void rxCallback(const CAN_message_t &msg) {
 }
 
 // -------------------------------------------------------------
-// 6. 메인 로직
+// 6. Main logic
 // -------------------------------------------------------------
 void setup() {
-  pinMode(LED_BUILTIN, OUTPUT); // 내장 LED 핀 출력 설정
+  pinMode(LED_BUILTIN, OUTPUT); // Set the built-in LED pin as output
 
   Serial.begin(115200);
   while (!Serial && millis() < 3000);
@@ -142,16 +142,16 @@ void loop() {
   if (printTimer >= PRINT_PERIOD_MS) {
     printTimer -= PRINT_PERIOD_MS;
 
-    // 내장 LED 상태 토글 (켜짐 <-> 꺼짐)
+    // Toggle built-in LED state (on <-> off)
     ledState = !ledState;
     digitalWrite(LED_BUILTIN, ledState);
 
-    // 1. 등록된 모든 모터에 상태 피드백 요청 프레임 전송
+    // 1. Send a status feedback request frame to all registered motors
     for (size_t i = 0; i < NUM_MOTORS; i++) {
       requestMotorStatus(MOTOR_IDS[i]);
     }
 
-    // 2. 수신된 최신 모터 상태 시리얼 출력
+    // 2. Print the latest received motor status over serial
     Serial.println("\n--- Motor Status ---");
     for (size_t i = 0; i < NUM_MOTORS; i++) {
       Serial.printf("[ID %2d] Pos: %7.3f rad | Vel: %6.2f rad/s | Trq: %6.2f Nm | State: %s\r\n",
