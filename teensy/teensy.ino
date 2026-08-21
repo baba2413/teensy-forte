@@ -98,6 +98,16 @@ volatile bool slave_valid_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
 bool offset_ready_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
 bool offset_ready_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
 
+// 'c' 로깅 전용 영점 (teensy-forte `goal` 브랜치와 동일한 개념이지만 용도가 다름).
+// 오직 상태 출력 줄(Serial.printf)에서 빼는 값일 뿐, pos_offset_can1/2나 제어 루프
+// (slave_target_raw 계산, operationControlCan1/2 호출)에는 절대 쓰이지 않는다 -- 그쪽은
+// 기존에 검증된 raw 좌표계 그대로 유지해야 실제 모터 명령이 안전하다. 'c'는 순수 로깅용.
+float zero_offset_master_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)] = {};
+float zero_offset_slave_can1[SAFE_BUF_SIZE(NUM_MOTORS_CAN1)]  = {};
+float zero_offset_master_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)] = {};
+float zero_offset_slave_can2[SAFE_BUF_SIZE(NUM_MOTORS_CAN2)]  = {};
+bool is_calibrated = false; // 'c'로 진입 -- 위 zero_offset_*가 현재 유효한지
+
 // Type 2 피드백의 fault 및 mode 상태 저장
 volatile uint8_t fault_bits_can1[256] = {0};
 volatile uint8_t fault_bits_can2[256] = {0};
@@ -507,6 +517,53 @@ void setupOffset() {
 }
 
 // -------------------------------------------------------------
+// 9b. 'c' 로깅 전용 영점 캘리브레이션
+//
+// setupOffset()('e' 전용)과는 완전히 독립적이다. 모터를 켜거나 끄지 않고, pos_offset_can1/2를
+// 건드리지 않고, 제어 루프에 아무 영향도 주지 않는다 -- 오직 아래 상태 출력 줄이 무엇을
+// 찍을지에만 관여한다. master_valid_can1/2, slave_valid_can1/2는 rxCallbackCan1/2에서 실제
+// 피드백을 받을 때마다 계속 true로 유지되므로(마지막 'e' 시도의 setupOffset()이 초기화하지
+// 않는 한) 새 상태를 따로 추적할 필요 없이 그대로 재사용한다.
+// -------------------------------------------------------------
+void calibrateZero() {
+  Serial.println("[Teensy] Calibrating zero offset (logging only) from current pose...");
+
+  bool all_ok = true;
+  for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
+    if (!master_valid_can1[i] || !slave_valid_can1[i]) {
+      Serial.printf("[CALIB CAN1] Pair %d: no CAN feedback yet -- FAILED\r\n", i + 1);
+      all_ok = false;
+      continue;
+    }
+    zero_offset_master_can1[i] = master_pos_can1[i];
+    zero_offset_slave_can1[i] = slave_pos_can1[i];
+    Serial.printf("[CALIB CAN1] Pair %d zero set (Master %d raw was %.3f, Slave %d raw was %.3f)\r\n",
+                  i + 1, MST_IDS_CAN1[i], zero_offset_master_can1[i],
+                  SLV_IDS_CAN1[i], zero_offset_slave_can1[i]);
+  }
+  for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
+    if (!master_valid_can2[i] || !slave_valid_can2[i]) {
+      Serial.printf("[CALIB CAN2] Pair %d: no CAN feedback yet -- FAILED\r\n", i + 1 + NUM_MOTORS_CAN1);
+      all_ok = false;
+      continue;
+    }
+    zero_offset_master_can2[i] = master_pos_can2[i];
+    zero_offset_slave_can2[i] = slave_pos_can2[i];
+    Serial.printf("[CALIB CAN2] Pair %d zero set (Master %d raw was %.3f, Slave %d raw was %.3f)\r\n",
+                  i + 1 + NUM_MOTORS_CAN1, MST_IDS_CAN2[i], zero_offset_master_can2[i],
+                  SLV_IDS_CAN2[i], zero_offset_slave_can2[i]);
+  }
+
+  is_calibrated = all_ok;
+  if (all_ok) {
+    Serial.println("[Teensy] Calibration complete. Status log now reads relative to this pose "
+                    "(logging only -- does not affect motor control).");
+  } else {
+    Serial.println("[Teensy] Calibration INCOMPLETE -- missing feedback for some motor(s). NOT calibrated.");
+  }
+}
+
+// -------------------------------------------------------------
 // 10. 메인 루프 구조
 // -------------------------------------------------------------
 void setup() {
@@ -534,7 +591,8 @@ void setup() {
   Can2.onReceive(rxCallbackCan2);
 
   Serial.println("Teensy CAN1/CAN2 initialized.");
-  Serial.println("-> Send 'e' to enable motors.");
+  Serial.println("-> Send 'e' to enable motors. Send 'c' to zero the status log (logging only, "
+                  "does not affect control).");
   controlTimer = 0;
 }
 
@@ -681,10 +739,15 @@ void loop() {
     if (millis() - lastPrint >= LOG_PERIOD) {
       lastPrint = millis();
 
+      // 'c'로 캘리브레이션된 경우 로그에는 영점 기준 상대값을 찍는다 (raw 모터 좌표계
+      // 그대로인 pos_offset_can1/2, 실제 제어 루프와는 무관 -- 오직 여기, 사람이/파이썬이
+      // 읽는 이 줄에만 영향). 캘리브레이션 전이면 zero_offset_*가 0.0이라 raw 그대로 찍힌다.
+      // 포맷 자체(숫자 하나)는 캘리브레이션 이전과 동일하게 유지했다 -- teensy_link.py의
+      // 정규식이 바뀔 필요가 없도록.
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
         Serial.printf("[CAN1] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
-                      MST_IDS_CAN1[i], master_pos_can1[i],
-                      SLV_IDS_CAN1[i], slave_pos_can1[i],
+                      MST_IDS_CAN1[i], master_pos_can1[i] - zero_offset_master_can1[i],
+                      SLV_IDS_CAN1[i], slave_pos_can1[i] - zero_offset_slave_can1[i],
                       pos_offset_can1[i],
                       (system_enabled && offset_ready_can1[i]) ? "ENABLED" : "DISABLED",
                       slave_trq_can1[i], mst_trq_state_can1[i].current_output_trq);
@@ -692,8 +755,8 @@ void loop() {
 
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
         Serial.printf("[CAN2] Master %d Pos: %.3f rad | Slave %d Pos: %.3f rad | Offset: %.3f (%s) | SLV Trq: %.2f Nm | MST FB: %.2f Nm\r\n",
-                      MST_IDS_CAN2[i], master_pos_can2[i],
-                      SLV_IDS_CAN2[i], slave_pos_can2[i],
+                      MST_IDS_CAN2[i], master_pos_can2[i] - zero_offset_master_can2[i],
+                      SLV_IDS_CAN2[i], slave_pos_can2[i] - zero_offset_slave_can2[i],
                       pos_offset_can2[i],
                       (system_enabled && offset_ready_can2[i]) ? "ENABLED" : "DISABLED",
                       slave_trq_can2[i], mst_trq_state_can2[i].current_output_trq);
@@ -711,7 +774,10 @@ void serialEvent() {
   if (Serial.available()) {
     char ch = Serial.read();
 
-    if (ch == 'e' || ch == 'E') {
+    if (ch == 'c' || ch == 'C') {
+      calibrateZero();
+    }
+    else if (ch == 'e' || ch == 'E') {
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
         enableMotorCan1(MST_IDS_CAN1[i]); delay(20);
         enableMotorCan1(SLV_IDS_CAN1[i]); delay(20);
