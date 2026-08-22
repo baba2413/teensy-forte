@@ -16,10 +16,21 @@ using namespace qindesign::network;
 // Hybrid transport, deliberately -- referenced from teensy-forte's isaacsim-udp branch, which
 // already solved the "one channel, two different jobs" problem we hit when 'g' lived on serial:
 //   USB serial : 'c' (calibrate zero) / 'd' (disable) -- single-char, human-supervised, no
-//                payload, no line parsing, no state machine to get stuck in.
-//   Ethernet UDP: the continuous goal-position stream. Fire-and-forget datagrams, no
+//                payload, no line parsing, no state machine to get stuck in. Typed by a person at
+//                minicom/screen directly -- the host's Python side never opens this port at all
+//                any more (see lerobot_robot_forte_arm's teensy_link.TeensyGoalLink), same
+//                reasoning as this repo's teleop-bi-c branch.
+//   Ethernet UDP: two independent one-way streams, both fire-and-forget datagrams (no
 //                "only one process can hold the port" constraint like serial has, no
-//                terminator-byte ambiguity -- each packet is a complete message.
+//                terminator-byte ambiguity -- each packet is a complete message):
+//                  host -> Teensy (UDP_PORT):           the continuous goal-position stream.
+//                  Teensy -> host (TELEMETRY_UDP_PORT):  periodic status line, mirroring what
+//                                                         teleop-bi-c already does with
+//                                                         sendTelemetryLine() -- lets the host
+//                                                         read positions without ever touching
+//                                                         serial, so that port stays free for a
+//                                                         human at minicom/screen the whole
+//                                                         session.
 //
 // Network: static IP, direct cable to the host (see IPAddress config below -- matches
 // isaacsim-udp and its proven host-side scripts, isaacsim_script/arm-ik/{test_udp,
@@ -73,6 +84,19 @@ IPAddress staticIP(192, 168, 1, 15);
 IPAddress subnetMask(255, 255, 255, 0);
 const uint16_t UDP_PORT = 5005;
 EthernetUDP udp;
+
+// Telemetry: host -> Teensy is UDP_PORT above; this is the Teensy -> host direction, same pattern
+// as teleop-bi-c's sendTelemetryLine(). Host address matches that branch's telemetryHostIP.
+IPAddress telemetryHostIP(192, 168, 1, 10);
+const uint16_t TELEMETRY_UDP_PORT = 5006;
+EthernetUDP telemetryUdp;
+
+void sendTelemetryLine(const char* line, size_t len) {
+  if (len == 0) return;
+  telemetryUdp.beginPacket(telemetryHostIP, TELEMETRY_UDP_PORT);
+  telemetryUdp.write((const uint8_t*)line, len);
+  telemetryUdp.endPacket();
+}
 
 // 'c' software zero + per-joint travel limits (ported from the "modify" commit on the
 // teensy-forte teleop-bi branch, reworked in terms of raw motor radians) -- this firmware applies
@@ -534,8 +558,9 @@ void setup() {
 
   Ethernet.begin(staticIP, subnetMask, IPAddress(0, 0, 0, 0)); // Direct cable, no gateway
   udp.begin(UDP_PORT);
-  Serial.printf("Ethernet up: %d.%d.%d.%d, UDP port %d\r\n",
-                staticIP[0], staticIP[1], staticIP[2], staticIP[3], UDP_PORT);
+  telemetryUdp.begin(TELEMETRY_UDP_PORT);
+  Serial.printf("Ethernet up: %d.%d.%d.%d, goal UDP port %d, telemetry UDP port %d\r\n",
+                staticIP[0], staticIP[1], staticIP[2], staticIP[3], UDP_PORT, TELEMETRY_UDP_PORT);
 
   Serial.println("-> Serial: 'c' to calibrate zero (recommended first), 'd' to disable.");
   Serial.println("-> UDP: send \"<yaw>,<pitch>,<roll>,<elbow>\" (raw rad) to move.");
@@ -657,19 +682,28 @@ void loop() {
       // against JOINT_LIMIT_MIN/MAX_CAN1/CAN2 (defined relative to zero_offset_*) without doing
       // the subtraction in your head. When NOT calibrated, zero_offset_* is still 0.0 (never
       // written), so both numbers come out equal -- that's expected, not a bug.
+      // Built into a buffer once per line so the exact same text goes out both Serial (human at
+      // minicom/screen) and telemetry UDP (host's TeensyGoalLink) -- same pattern as teleop-bi-c.
+      char line_buf[160];
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
-        Serial.printf("[CAN1] Slave %d Pos: %.3f (%.3f) rad | Target: %.3f (%.3f) rad (%s / %s) | Trq: %.2f Nm\r\n",
+        int len = snprintf(line_buf, sizeof(line_buf),
+                      "[CAN1] Slave %d Pos: %.3f (%.3f) rad | Target: %.3f (%.3f) rad (%s / %s) | Trq: %.2f Nm\r\n",
                       SLV_IDS_CAN1[i],
                       slave_pos_can1[i] - zero_offset_can1[i], slave_pos_can1[i],
                       goal_target_can1[i] - zero_offset_can1[i], goal_target_can1[i],
                       mode_str, calib_str, slave_trq_can1[i]);
+        Serial.print(line_buf);
+        sendTelemetryLine(line_buf, (size_t)len);
       }
       for (int i = 0; i < NUM_MOTORS_CAN2; i++) {
-        Serial.printf("[CAN2] Slave %d Pos: %.3f (%.3f) rad | Target: %.3f (%.3f) rad (%s / %s) | Trq: %.2f Nm\r\n",
+        int len = snprintf(line_buf, sizeof(line_buf),
+                      "[CAN2] Slave %d Pos: %.3f (%.3f) rad | Target: %.3f (%.3f) rad (%s / %s) | Trq: %.2f Nm\r\n",
                       SLV_IDS_CAN2[i],
                       slave_pos_can2[i] - zero_offset_can2[i], slave_pos_can2[i],
                       goal_target_can2[i] - zero_offset_can2[i], goal_target_can2[i],
                       mode_str, calib_str, slave_trq_can2[i]);
+        Serial.print(line_buf);
+        sendTelemetryLine(line_buf, (size_t)len);
       }
 
       if (goal_mode_enabled) {
