@@ -15,11 +15,15 @@ using namespace qindesign::network;
 //
 // Hybrid transport, deliberately -- referenced from teensy-forte's isaacsim-udp branch, which
 // already solved the "one channel, two different jobs" problem we hit when 'g' lived on serial:
-//   USB serial : 'c' (calibrate zero) / 'd' (disable) -- single-char, human-supervised, no
-//                payload, no line parsing, no state machine to get stuck in. Typed by a person at
-//                minicom/screen directly -- the host's Python side never opens this port at all
-//                any more (see lerobot_robot_forte_arm's teensy_link.TeensyGoalLink), same
-//                reasoning as this repo's teleop-bi-c branch.
+//   USB serial : 'e' (arm UDP) / 'c' (calibrate zero) / 'd' (disable + disarm) -- single-char,
+//                human-supervised, no payload, no line parsing, no state machine to get stuck in.
+//                Typed by a person at minicom/screen directly -- the host's Python side never
+//                opens this port at all (see lerobot_robot_forte_arm's teensy_link.TeensyGoalLink),
+//                same reasoning as this repo's teleop-bi-c branch. UDP goal packets are ignored
+//                entirely (see udp_armed) until 'e' is sent -- not auto-armed at boot or by
+//                anything else -- and 'd' clears that arming, not just a timed ignore window, so
+//                'd' is a real stop even while the host keeps streaming packets (see
+//                handleGoalPacket()).
 //   Ethernet UDP: two independent one-way streams, both fire-and-forget datagrams (no
 //                "only one process can hold the port" constraint like serial has, no
 //                terminator-byte ambiguity -- each packet is a complete message):
@@ -147,6 +151,14 @@ const uint32_t LOG_PERIOD = 1000;
 // -------------------------------------------------------------
 bool goal_mode_enabled = false; // Entered via UDP packet, cleared with 'd'
 bool is_calibrated = false;     // Entered via 'c' -- whether the zero (zero_offset_*) is currently valid
+
+// Entered via 'e', cleared with 'd' or at boot -- whether UDP goal packets are allowed to do
+// anything at all. Deliberately NOT auto-set at boot or by anything else: the host's control loop
+// re-sends goal packets continuously (that's what keeps GOAL_TIMEOUT_MS satisfied), so without
+// this gate 'd' only pauses the arm for DISABLE_IGNORE_MS before the very next incoming packet
+// silently re-enables it -- 'd' needs to actually be a stop, not a pause, regardless of whether
+// the host is still streaming. See handleGoalPacket().
+bool udp_armed = false;
 
 volatile float slave_pos_can1[NUM_MOTORS_CAN1] = {};
 volatile float slave_trq_can1[NUM_MOTORS_CAN1] = {};
@@ -488,6 +500,18 @@ void enterGoalModeIfNeeded() {
 // is natural (if the caller wants to hold the current position, it just sends that same value
 // back).
 void handleGoalPacket(char* buf) {
+  if (!udp_armed) {
+    // Not armed -- see udp_armed's declaration for why this exists. Ignored unconditionally, not
+    // just for a timed window: the host's control loop keeps streaming packets regardless, so
+    // this has to hold until an explicit 'e', not expire on its own.
+    static uint32_t lastNotArmedWarnMs = 0;
+    if (millis() - lastNotArmedWarnMs > 200) {
+      lastNotArmedWarnMs = millis();
+      Serial.println("[Teensy] GOAL packet ignored (not armed -- send 'e' first).");
+    }
+    return;
+  }
+
   if (millis() < ignore_goal_packets_until_ms) {
     // Ignore window right after 'd' -- see DISABLE_IGNORE_MS. Prevents a stray packet already
     // sent before 'd' from arriving late and invalidating the disable that was just issued.
@@ -562,7 +586,8 @@ void setup() {
   Serial.printf("Ethernet up: %d.%d.%d.%d, goal UDP port %d, telemetry UDP port %d\r\n",
                 staticIP[0], staticIP[1], staticIP[2], staticIP[3], UDP_PORT, TELEMETRY_UDP_PORT);
 
-  Serial.println("-> Serial: 'c' to calibrate zero (recommended first), 'd' to disable.");
+  Serial.println("-> Serial: 'e' to arm UDP goal packets (required before any motion), 'c' to");
+  Serial.println("   calibrate zero (recommended first), 'd' to disable + disarm.");
   Serial.println("-> UDP: send \"<yaw>,<pitch>,<roll>,<elbow>\" (raw rad) to move.");
   controlTimer = 0;
 }
@@ -717,9 +742,9 @@ void loop() {
 }
 
 // -------------------------------------------------------------
-// 11. Serial command receive interrupt -- only 'c'/'d', both single-character immediate
-// commands, so no line buffering or state machine is needed at all (unlike when 'g' existed
-// before being moved to UDP).
+// 11. Serial command receive interrupt -- 'c'/'d'/'e', all single-character immediate commands,
+// so no line buffering or state machine is needed at all (unlike when 'g' existed before being
+// moved to UDP).
 // -------------------------------------------------------------
 void serialEvent() {
   while (Serial.available()) {
@@ -728,9 +753,14 @@ void serialEvent() {
     if (ch == 'c' || ch == 'C') {
       calibrateZero();
     }
+    else if (ch == 'e' || ch == 'E') {
+      udp_armed = true;
+      Serial.println("[Teensy] UDP goal packets ARMED via 'e'. Send 'd' to disarm and stop.");
+    }
     else if (ch == 'd' || ch == 'D') {
       goal_mode_enabled = false;
       is_calibrated = false; // full stop invalidates the zero reference -- re-'c' before trusting it again
+      udp_armed = false; // real stop, not a pause -- see udp_armed's declaration for why
       ignore_goal_packets_until_ms = millis() + DISABLE_IGNORE_MS; // drop stragglers, see DISABLE_IGNORE_MS
 
       for (int i = 0; i < NUM_MOTORS_CAN1; i++) {
@@ -740,7 +770,7 @@ void serialEvent() {
         disableMotorCan2(SLV_IDS_CAN2[i]); delay(20);
       }
 
-      Serial.println("[Teensy] Motors Disabled. Send 'c' to re-calibrate before sending goal packets again.");
+      Serial.println("[Teensy] Motors Disabled. Send 'e' to re-arm, 'c' to re-calibrate, before sending goal packets again.");
     }
     // Any other character is not a command, so it's ignored.
   }
